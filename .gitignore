@@ -15,3 +15,5 @@ Thumbs.db
 # Local env/config
 .env
 .env.*
+out
+*.patch

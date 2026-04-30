@@ -1,12 +1,13 @@
 use macroquad::camera::Camera;
 use macroquad::prelude::*;
-use num_complex::Complex64;
+use num_complex::{Complex64, ComplexFloat};
 use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_SAMPLES_PER_AXIS: usize = 121;
 const MIN_SAMPLES_PER_AXIS: usize = 5;
-const MAX_SAMPLES_PER_AXIS: usize = 255;
+const MAX_SAMPLES_PER_AXIS: usize = 1024;
+const MAX_MESH_SAMPLES_PER_AXIS: usize = 255;
 const DOMAIN_EXTENT: f32 = 1.55;
 const Y_EXTENT: f32 = 1.25;
 const AUTO_ROTATE_RADIANS_PER_SEC: f32 = 0.28;
@@ -25,10 +26,10 @@ fn window_conf() -> macroquad::conf::Conf {
             sample_count: 4,
             ..Default::default()
         },
-        // draw_mesh() is clamped to these capacities; keep them above one surface mesh
-        // at the maximum supported resolution.
-        draw_call_vertex_capacity: MAX_SAMPLES_PER_AXIS * MAX_SAMPLES_PER_AXIS + 1024,
-        draw_call_index_capacity: (MAX_SAMPLES_PER_AXIS - 1) * (MAX_SAMPLES_PER_AXIS - 1) * 6 + 1024,
+        // draw_mesh() uses u16 indices internally. Larger sample grids are split into
+        // multiple tiles, each no larger than MAX_MESH_SAMPLES_PER_AXIS per axis.
+        draw_call_vertex_capacity: MAX_MESH_SAMPLES_PER_AXIS * MAX_MESH_SAMPLES_PER_AXIS + 1024,
+        draw_call_index_capacity: (MAX_MESH_SAMPLES_PER_AXIS - 1) * (MAX_MESH_SAMPLES_PER_AXIS - 1) * 6 + 1024,
         ..Default::default()
     }
 }
@@ -68,6 +69,7 @@ async fn main() {
         show_abs: true,
         transparent_surfaces: false,
         wireframe_mode: false,
+        fullscreen: false,
         yaw: 0.75,
         pitch: 0.52,
         roll: 0.0,
@@ -87,6 +89,10 @@ async fn main() {
 
         if is_key_pressed(KeyCode::F1) {
             state.show_help = !state.show_help;
+        }
+        if is_key_pressed(KeyCode::F11) {
+            state.fullscreen = !state.fullscreen;
+            set_fullscreen(state.fullscreen);
         }
         if is_key_pressed(KeyCode::R) {
             state.auto_rotate = !state.auto_rotate;
@@ -221,13 +227,13 @@ async fn main() {
                 }
             } else {
                 if state.show_abs {
-                    draw_mesh(&plot.abs_mesh);
+                    draw_meshes(&plot.abs_meshes);
                 }
                 if state.show_imag {
-                    draw_mesh(&plot.imag_mesh);
+                    draw_meshes(&plot.imag_meshes);
                 }
                 if state.show_real {
-                    draw_mesh(&plot.real_mesh);
+                    draw_meshes(&plot.real_meshes);
                 }
             }
             labels = draw_axes_and_ticks(&state.domain, plot);
@@ -393,6 +399,7 @@ struct AppState {
     show_abs: bool,
     transparent_surfaces: bool,
     wireframe_mode: bool,
+    fullscreen: bool,
     yaw: f32,
     pitch: f32,
     roll: f32,
@@ -489,9 +496,9 @@ impl AppState {
 }
 
 struct PlotData {
-    real_mesh: Mesh,
-    imag_mesh: Mesh,
-    abs_mesh: Mesh,
+    real_meshes: Vec<Mesh>,
+    imag_meshes: Vec<Mesh>,
+    abs_meshes: Vec<Mesh>,
     y: Range,
     finite_sample_count: usize,
     total_sample_count: usize,
@@ -535,7 +542,6 @@ fn build_plot(
 ) -> PlotData {
     let n = samples_per_axis;
     assert!(n >= 2);
-    assert!(n * n <= u16::MAX as usize);
     let steps = n - 1;
 
     let mut samples = vec![Sample::invalid(); n * n];
@@ -591,35 +597,47 @@ fn build_plot(
     }
 
     let y = Range { min: y_min, max: y_max };
-    let real_mesh = build_surface_mesh(
-        &samples,
-        n,
-        domain,
-        y,
-        SurfaceKind::Real,
-        transparent_surfaces,
-    );
-    let imag_mesh = build_surface_mesh(
-        &samples,
-        n,
-        domain,
-        y,
-        SurfaceKind::Imag,
-        transparent_surfaces,
-    );
-    let abs_mesh = build_surface_mesh(
-        &samples,
-        n,
-        domain,
-        y,
-        SurfaceKind::Abs,
-        transparent_surfaces,
-    );
+    let real_meshes = if visibility.show_real {
+        build_surface_meshes(
+            &samples,
+            n,
+            domain,
+            y,
+            SurfaceKind::Real,
+            transparent_surfaces,
+        )
+    } else {
+        Vec::new()
+    };
+    let imag_meshes = if visibility.show_imag {
+        build_surface_meshes(
+            &samples,
+            n,
+            domain,
+            y,
+            SurfaceKind::Imag,
+            transparent_surfaces,
+        )
+    } else {
+        Vec::new()
+    };
+    let abs_meshes = if visibility.show_abs {
+        build_surface_meshes(
+            &samples,
+            n,
+            domain,
+            y,
+            SurfaceKind::Abs,
+            transparent_surfaces,
+        )
+    } else {
+        Vec::new()
+    };
 
     PlotData {
-        real_mesh,
-        imag_mesh,
-        abs_mesh,
+        real_meshes,
+        imag_meshes,
+        abs_meshes,
         y,
         finite_sample_count,
         total_sample_count: n * n,
@@ -654,23 +672,72 @@ impl SurfaceKind {
     }
 }
 
-fn build_surface_mesh(
+fn build_surface_meshes(
     samples: &[Sample],
     samples_per_axis: usize,
     domain: Domain,
     y_range: Range,
     kind: SurfaceKind,
     transparent: bool,
+) -> Vec<Mesh> {
+    let mut meshes = Vec::new();
+    let tile_stride = MAX_MESH_SAMPLES_PER_AXIS - 1;
+    let mut z0 = 0usize;
+
+    while z0 < samples_per_axis - 1 {
+        let z1 = (z0 + tile_stride).min(samples_per_axis - 1);
+        let mut x0 = 0usize;
+        while x0 < samples_per_axis - 1 {
+            let x1 = (x0 + tile_stride).min(samples_per_axis - 1);
+            meshes.push(build_surface_mesh_tile(
+                samples,
+                samples_per_axis,
+                domain,
+                y_range,
+                kind,
+                transparent,
+                x0,
+                x1,
+                z0,
+                z1,
+            ));
+            x0 = x1;
+        }
+        z0 = z1;
+    }
+
+    meshes
+}
+
+fn build_surface_mesh_tile(
+    samples: &[Sample],
+    samples_per_axis: usize,
+    domain: Domain,
+    y_range: Range,
+    kind: SurfaceKind,
+    transparent: bool,
+    x0: usize,
+    x1: usize,
+    z0: usize,
+    z1: usize,
 ) -> Mesh {
     let n = samples_per_axis;
     let steps = n - 1;
-    let mut vertices = Vec::with_capacity(n * n);
+    let tile_w = x1 - x0 + 1;
+    let tile_h = z1 - z0 + 1;
+    assert!(tile_w <= MAX_MESH_SAMPLES_PER_AXIS);
+    assert!(tile_h <= MAX_MESH_SAMPLES_PER_AXIS);
+    assert!(tile_w * tile_h <= u16::MAX as usize);
+
+    let mut vertices = Vec::with_capacity(tile_w * tile_h);
     let color = kind.color(transparent);
 
-    for iz in 0..n {
+    for lz in 0..tile_h {
+        let iz = z0 + lz;
         let im_t = iz as f64 / steps as f64;
         let im = lerp_f64(domain.im.min, domain.im.max, im_t);
-        for ix in 0..n {
+        for lx in 0..tile_w {
+            let ix = x0 + lx;
             let re_t = ix as f64 / steps as f64;
             let re = lerp_f64(domain.re.min, domain.re.max, re_t);
             let sample = samples[iz * n + ix];
@@ -684,14 +751,18 @@ fn build_surface_mesh(
         }
     }
 
-    let mut indices: Vec<u16> = Vec::with_capacity(steps * steps * 6);
-    for iz in 0..steps {
-        for ix in 0..steps {
-            let a = iz * n + ix;
-            let b = iz * n + ix + 1;
-            let c = (iz + 1) * n + ix + 1;
-            let d = (iz + 1) * n + ix;
-            if samples[a].valid && samples[b].valid && samples[c].valid && samples[d].valid {
+    let mut indices: Vec<u16> = Vec::with_capacity((tile_w - 1) * (tile_h - 1) * 6);
+    for lz in 0..(tile_h - 1) {
+        for lx in 0..(tile_w - 1) {
+            let ga = (z0 + lz) * n + (x0 + lx);
+            let gb = (z0 + lz) * n + (x0 + lx + 1);
+            let gc = (z0 + lz + 1) * n + (x0 + lx + 1);
+            let gd = (z0 + lz + 1) * n + (x0 + lx);
+            if samples[ga].valid && samples[gb].valid && samples[gc].valid && samples[gd].valid {
+                let a = lz * tile_w + lx;
+                let b = lz * tile_w + lx + 1;
+                let c = (lz + 1) * tile_w + lx + 1;
+                let d = (lz + 1) * tile_w + lx;
                 indices.extend_from_slice(&[
                     a as u16, b as u16, c as u16, a as u16, c as u16, d as u16,
                 ]);
@@ -703,6 +774,12 @@ fn build_surface_mesh(
         vertices,
         indices,
         texture: None,
+    }
+}
+
+fn draw_meshes(meshes: &[Mesh]) {
+    for mesh in meshes {
+        draw_mesh(mesh);
     }
 }
 
@@ -999,11 +1076,12 @@ fn draw_hud(state: &AppState) {
         y += line;
         draw_text(
             &format!(
-                "samples={}x{}  mode={}  alpha={}  visible: [1]Re={} [2]Im={} [3]|f|={}",
+                "samples={}x{}  mode={}  alpha={}  fullscreen={}  visible: [1]Re={} [2]Im={} [3]|f|={}",
                 state.samples_per_axis,
                 state.samples_per_axis,
                 if state.wireframe_mode { "wireframe" } else { "filled" },
                 if state.transparent_surfaces { "0.5" } else { "1.0" },
+                on_off(state.fullscreen),
                 on_off(state.show_real),
                 on_off(state.show_imag),
                 on_off(state.show_abs),
@@ -1033,7 +1111,7 @@ fn draw_hud(state: &AppState) {
     if state.show_help {
         y += 8.0;
         let help = [
-            "F1 hide/show help",
+            "F1 hide/show help, F11 toggle fullscreen",
             "R toggle auto-rotation, A/D yaw, W/S pitch, Q/E roll",
             "Z expand domain by 1.1, X shrink domain by 1.1",
             "H/L move real domain -/+ 10%, J/K move imag domain -/+ 10%",
@@ -1143,17 +1221,34 @@ fn eval_function(name: &str, args: &[Expr], x: C) -> C {
     let two = C::new(2.0, 0.0);
     match name {
         "abs" | "mag" | "mod" | "norm" => C::new(args[0].eval(x).norm(), 0.0),
+        "abs2" | "mag2" | "norm_sqr" | "normsq" => C::new(args[0].eval(x).norm_sqr(), 0.0),
+        "l1_norm" | "l1" | "manhattan" | "taxicab" => C::new(args[0].eval(x).l1_norm(), 0.0),
         "arg" | "phase" => C::new(args[0].eval(x).arg(), 0.0),
+        "to_polar" => {
+            let (r, theta) = args[0].eval(x).to_polar();
+            C::new(r, theta)
+        }
+        "polar_r" | "radius" => C::new(args[0].eval(x).to_polar().0, 0.0),
+        "polar_theta" | "theta" => C::new(args[0].eval(x).to_polar().1, 0.0),
         "re" | "real" => C::new(args[0].eval(x).re, 0.0),
         "im" | "imag" => C::new(args[0].eval(x).im, 0.0),
         "conj" | "conjugate" => args[0].eval(x).conj(),
+        "inv" => args[0].eval(x).inv(),
+        "recip" | "inverse" => args[0].eval(x).recip(),
+        "finv" => args[0].eval(x).finv(),
+        "is_nan" | "isnan" => bool_to_complex(args[0].eval(x).is_nan()),
+        "is_infinite" | "isinf" | "isinfinite" => bool_to_complex(args[0].eval(x).is_infinite()),
+        "is_finite" | "isfinite" => bool_to_complex(args[0].eval(x).is_finite()),
+        "is_normal" | "isnormal" => bool_to_complex(args[0].eval(x).is_normal()),
         "sgn" | "sign" | "signum" => {
             let z = args[0].eval(x);
             let n = z.norm();
             if n == 0.0 { C::new(0.0, 0.0) } else { z / C::new(n, 0.0) }
         }
+        "cis" => C::cis(args[0].eval(x).re),
         "exp" => args[0].eval(x).exp(),
         "exp2" => args[0].eval(x).exp2(),
+        "expf" => args[0].eval(x).expf(args[1].eval(x).re),
         "ln" => args[0].eval(x).ln(),
         "log" => {
             if args.len() == 1 {
@@ -1188,10 +1283,16 @@ fn eval_function(name: &str, args: &[Expr], x: C) -> C {
         "sech" => one / args[0].eval(x).cosh(),
         "csch" => one / args[0].eval(x).sinh(),
         "coth" => one / args[0].eval(x).tanh(),
-        "pow" => args[0].eval(x).powc(args[1].eval(x)),
+        "pow" | "powc" => args[0].eval(x).powc(args[1].eval(x)),
+        "powf" => args[0].eval(x).powf(args[1].eval(x).re),
+        "powi" => args[0].eval(x).powi(complex_to_i32(args[1].eval(x))),
+        "powu" => args[0].eval(x).powu(complex_to_u32(args[1].eval(x))),
         "root" => args[0].eval(x).powc(one / args[1].eval(x)),
-        "complex" | "rect" => C::new(args[0].eval(x).re, args[1].eval(x).re),
-        "polar" => C::from_polar(args[0].eval(x).re, args[1].eval(x).re),
+        "scale" => args[0].eval(x).scale(args[1].eval(x).re),
+        "unscale" => args[0].eval(x).unscale(args[1].eval(x).re),
+        "fdiv" => args[0].eval(x).fdiv(args[1].eval(x)),
+        "complex" | "rect" | "new" => C::new(args[0].eval(x).re, args[1].eval(x).re),
+        "polar" | "from_polar" => C::from_polar(args[0].eval(x).re, args[1].eval(x).re),
         "floor" => {
             let z = args[0].eval(x);
             C::new(z.re.floor(), z.im.floor())
@@ -1224,6 +1325,32 @@ fn eval_function(name: &str, args: &[Expr], x: C) -> C {
         }
         "avg" => (args[0].eval(x) + args[1].eval(x)) / two,
         _ => C::new(f64::NAN, f64::NAN), // unreachable after parser validation
+    }
+}
+
+fn bool_to_complex(v: bool) -> C {
+    C::new(if v { 1.0 } else { 0.0 }, 0.0)
+}
+
+fn complex_to_i32(z: C) -> i32 {
+    if !z.re.is_finite() {
+        0
+    } else if z.re > i32::MAX as f64 {
+        i32::MAX
+    } else if z.re < i32::MIN as f64 {
+        i32::MIN
+    } else {
+        z.re.round() as i32
+    }
+}
+
+fn complex_to_u32(z: C) -> u32 {
+    if !z.re.is_finite() || z.re <= 0.0 {
+        0
+    } else if z.re > u32::MAX as f64 {
+        u32::MAX
+    } else {
+        z.re.round() as u32
     }
 }
 
@@ -1583,19 +1710,47 @@ fn is_function_name(name: &str) -> bool {
         "abs" | "mag"
             | "mod"
             | "norm"
+            | "abs2"
+            | "mag2"
+            | "norm_sqr"
+            | "normsq"
+            | "l1_norm"
+            | "l1"
+            | "manhattan"
+            | "taxicab"
             | "arg"
             | "phase"
+            | "to_polar"
+            | "polar_r"
+            | "radius"
+            | "polar_theta"
+            | "theta"
             | "re"
             | "real"
             | "im"
             | "imag"
             | "conj"
             | "conjugate"
+            | "recip"
+            | "inverse"
+            | "inv"
+            | "finv"
+            | "is_nan"
+            | "isnan"
+            | "is_infinite"
+            | "isinf"
+            | "isinfinite"
+            | "is_finite"
+            | "isfinite"
+            | "is_normal"
+            | "isnormal"
             | "sgn"
             | "sign"
             | "signum"
+            | "cis"
             | "exp"
             | "exp2"
+            | "expf"
             | "ln"
             | "log"
             | "log2"
@@ -1629,10 +1784,19 @@ fn is_function_name(name: &str) -> bool {
             | "csch"
             | "coth"
             | "pow"
+            | "powc"
+            | "powf"
+            | "powi"
+            | "powu"
             | "root"
+            | "scale"
+            | "unscale"
+            | "fdiv"
             | "complex"
             | "rect"
+            | "new"
             | "polar"
+            | "from_polar"
             | "floor"
             | "ceil"
             | "round"
@@ -1647,14 +1811,20 @@ fn is_function_name(name: &str) -> bool {
 
 fn validate_function(name: &str, arity: usize) -> Result<(), String> {
     let ok = match name {
-        "abs" | "mag" | "mod" | "norm" | "arg" | "phase" | "re" | "real" | "im"
-        | "imag" | "conj" | "conjugate" | "sgn" | "sign" | "signum" | "exp" | "exp2"
+        "abs" | "mag" | "mod" | "norm" | "abs2" | "mag2" | "norm_sqr" | "normsq"
+        | "l1_norm" | "l1" | "manhattan" | "taxicab" | "arg" | "phase" | "to_polar"
+        | "polar_r" | "radius" | "polar_theta" | "theta" | "re" | "real" | "im"
+        | "imag" | "conj" | "conjugate" | "recip" | "inverse" | "inv" | "finv" | "is_nan"
+        | "isnan" | "is_infinite" | "isinf" | "isinfinite" | "is_finite" | "isfinite"
+        | "is_normal" | "isnormal" | "sgn" | "sign" | "signum" | "cis" | "exp" | "exp2"
         | "ln" | "log2" | "log10" | "sqrt" | "cbrt" | "sqr" | "square" | "sin" | "cos"
         | "tan" | "asin" | "arcsin" | "acos" | "arccos" | "atan" | "arctan" | "sinh"
         | "cosh" | "tanh" | "asinh" | "arcsinh" | "acosh" | "arccosh" | "atanh"
         | "arctanh" | "sec" | "csc" | "cot" | "sech" | "csch" | "coth" | "floor"
         | "ceil" | "round" | "trunc" | "frac" | "fract" => arity == 1,
-        "pow" | "root" | "complex" | "rect" | "polar" | "minabs" | "maxabs" | "avg" => arity == 2,
+        "pow" | "powc" | "powf" | "powi" | "powu" | "root" | "scale" | "unscale"
+        | "fdiv" | "complex" | "rect" | "new" | "polar" | "from_polar" | "minabs"
+        | "maxabs" | "avg" | "expf" => arity == 2,
         "log" => arity == 1 || arity == 2,
         _ => return Err(format!("unknown function `{name}`")),
     };
