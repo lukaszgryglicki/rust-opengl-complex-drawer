@@ -8,12 +8,14 @@ const DEFAULT_SAMPLES_PER_AXIS: usize = 191;
 const MIN_SAMPLES_PER_AXIS: usize = 5;
 const MAX_SAMPLES_PER_AXIS: usize = 1024;
 const MAX_MESH_SAMPLES_PER_AXIS: usize = 255;
-const DEFAULT_ISO_LINE_COUNT: usize = 49;
+const DEFAULT_ISO_LINE_COUNT: usize = 99;
 const MIN_ISO_LINE_COUNT: usize = 1;
 const MAX_ISO_LINE_COUNT: usize = 255;
 const DOMAIN_EXTENT: f32 = 1.55;
 const Y_EXTENT: f32 = 1.25;
 const ISO_LINE_LIFT: f32 = 0.006;
+const KEY_REPEAT_INITIAL_DELAY_SECONDS: f64 = 1.0;
+const KEY_REPEAT_INTERVAL_SECONDS: f64 = 1.0 / 30.0;
 const AUTO_ROTATE_RADIANS_PER_SEC: f32 = 0.15;
 const MANUAL_ROTATE_RADIANS_PER_SEC: f32 = 0.95;
 const TRANSPARENT_ALPHA: f32 = 0.50;
@@ -86,12 +88,27 @@ async fn main() {
 
     state.rebuild_plot();
 
+    let mut repeat_keys = KeyRepeater::new(&[
+        KeyCode::Z,
+        KeyCode::X,
+        KeyCode::H,
+        KeyCode::L,
+        KeyCode::J,
+        KeyCode::K,
+        KeyCode::N,
+        KeyCode::M,
+        KeyCode::U,
+        KeyCode::O,
+    ]);
+
+
     loop {
         if is_key_pressed(KeyCode::Escape) {
             break;
         }
 
         let mut rebuild_plot = false;
+        let now = get_time();
 
         if is_key_pressed(KeyCode::F1) {
             state.show_help = !state.show_help;
@@ -109,36 +126,36 @@ async fn main() {
         }
 
         // Domain controls: one discrete update per key press.
-        if is_key_pressed(KeyCode::Z) {
+        if repeat_keys.should_fire(KeyCode::Z, now) {
             state.domain.scale_about_center(1.1);
             rebuild_plot = true;
         }
-        if is_key_pressed(KeyCode::X) {
+        if repeat_keys.should_fire(KeyCode::X, now) {
             state.domain.scale_about_center(1.0 / 1.1);
             rebuild_plot = true;
         }
-        if is_key_pressed(KeyCode::H) {
+        if repeat_keys.should_fire(KeyCode::H, now) {
             state.domain.shift_re(-0.10);
             rebuild_plot = true;
         }
-        if is_key_pressed(KeyCode::L) {
+        if repeat_keys.should_fire(KeyCode::L, now) {
             state.domain.shift_re(0.10);
             rebuild_plot = true;
         }
-        if is_key_pressed(KeyCode::J) {
+        if repeat_keys.should_fire(KeyCode::J, now) {
             state.domain.shift_im(-0.10);
             rebuild_plot = true;
         }
-        if is_key_pressed(KeyCode::K) {
+        if repeat_keys.should_fire(KeyCode::K, now) {
             state.domain.shift_im(0.10);
             rebuild_plot = true;
         }
 
         // Resolution controls.
-        if is_key_pressed(KeyCode::N) {
+        if repeat_keys.should_fire(KeyCode::N, now) {
             rebuild_plot |= state.scale_samples(1.0 / 1.1);
         }
-        if is_key_pressed(KeyCode::M) {
+        if repeat_keys.should_fire(KeyCode::M, now) {
             rebuild_plot |= state.scale_samples(1.1);
         }
 
@@ -166,10 +183,10 @@ async fn main() {
             state.iso_lines_enabled = !state.iso_lines_enabled;
             rebuild_plot = true;
         }
-        if is_key_pressed(KeyCode::U) {
+        if repeat_keys.should_fire(KeyCode::U, now) {
             rebuild_plot |= state.change_iso_line_count(-1);
         }
-        if is_key_pressed(KeyCode::O) {
+        if repeat_keys.should_fire(KeyCode::O, now) {
             rebuild_plot |= state.change_iso_line_count(1);
         }
 
@@ -448,6 +465,57 @@ impl Domain {
 
     fn shift_im(&mut self, fraction: f64) {
         self.im.shift_by_fraction(fraction);
+    }
+}
+
+struct KeyRepeater {
+    states: Vec<KeyRepeatState>,
+}
+
+struct KeyRepeatState {
+    key: KeyCode,
+    was_down: bool,
+    next_repeat_time: f64,
+}
+
+impl KeyRepeater {
+    fn new(keys: &[KeyCode]) -> Self {
+        Self {
+            states: keys
+                .iter()
+                .copied()
+                .map(|key| KeyRepeatState {
+                    key,
+                    was_down: false,
+                    next_repeat_time: 0.0,
+                })
+                .collect(),
+        }
+    }
+
+    fn should_fire(&mut self, key: KeyCode, now: f64) -> bool {
+        let Some(state) = self.states.iter_mut().find(|state| state.key == key) else {
+            return is_key_pressed(key);
+        };
+
+        if !is_key_down(key) {
+            state.was_down = false;
+            state.next_repeat_time = 0.0;
+            return false;
+        }
+
+        if !state.was_down {
+            state.was_down = true;
+            state.next_repeat_time = now + KEY_REPEAT_INITIAL_DELAY_SECONDS;
+            return true;
+        }
+
+        if now >= state.next_repeat_time {
+            state.next_repeat_time = now + KEY_REPEAT_INTERVAL_SECONDS;
+            return true;
+        }
+
+        false
     }
 }
 

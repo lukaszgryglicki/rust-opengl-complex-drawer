@@ -47,6 +47,8 @@ If omitted, both domains default to `[-2, 2]`.
 - `F11`: toggle fullscreen
 - `Esc`: quit
 
+Hold adjustment keys (`Z`, `X`, `H`, `L`, `J`, `K`, `N`, `M`, `U`, `O`) to repeat. The first repeated action starts after about one second, then repeats at a normal keyboard-repeat rate.
+
 ## Iso-value lines
 
 Iso-value lines are contour lines drawn on the currently visible surfaces.
@@ -58,6 +60,8 @@ For each visible surface, the program uses that surface's own sampled value rang
 ```
 
 That is, the range is divided into `count + 1` equal intervals and the internal division points are drawn. The default iso-line count is `4`. In filled mode, iso-value lines are drawn as an overlay. In wireframe mode, when iso-value lines are enabled, they replace the regular rectangular grid wireframe.
+
+The iso-line count can be adjusted from `1` to `255`.
 
 ## Expression grammar
 
