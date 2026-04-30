@@ -8,8 +8,12 @@ const DEFAULT_SAMPLES_PER_AXIS: usize = 121;
 const MIN_SAMPLES_PER_AXIS: usize = 5;
 const MAX_SAMPLES_PER_AXIS: usize = 1024;
 const MAX_MESH_SAMPLES_PER_AXIS: usize = 255;
+const DEFAULT_ISO_LINE_COUNT: usize = 4;
+const MIN_ISO_LINE_COUNT: usize = 1;
+const MAX_ISO_LINE_COUNT: usize = 64;
 const DOMAIN_EXTENT: f32 = 1.55;
 const Y_EXTENT: f32 = 1.25;
+const ISO_LINE_LIFT: f32 = 0.006;
 const AUTO_ROTATE_RADIANS_PER_SEC: f32 = 0.28;
 const MANUAL_ROTATE_RADIANS_PER_SEC: f32 = 1.35;
 const TRANSPARENT_ALPHA: f32 = 0.50;
@@ -69,6 +73,8 @@ async fn main() {
         show_abs: true,
         transparent_surfaces: false,
         wireframe_mode: false,
+        iso_lines_enabled: false,
+        iso_line_count: DEFAULT_ISO_LINE_COUNT,
         fullscreen: false,
         yaw: 0.75,
         pitch: 0.52,
@@ -156,6 +162,16 @@ async fn main() {
         if is_key_pressed(KeyCode::F) {
             state.wireframe_mode = !state.wireframe_mode;
         }
+        if is_key_pressed(KeyCode::I) {
+            state.iso_lines_enabled = !state.iso_lines_enabled;
+            rebuild_plot = true;
+        }
+        if is_key_pressed(KeyCode::U) {
+            rebuild_plot |= state.change_iso_line_count(-1);
+        }
+        if is_key_pressed(KeyCode::O) {
+            rebuild_plot |= state.change_iso_line_count(1);
+        }
 
         if rebuild_plot {
             state.rebuild_plot();
@@ -195,35 +211,59 @@ async fn main() {
         let mut labels = Vec::<(Vec3, String, Color)>::new();
         if let Some(plot) = &state.plot {
             if state.wireframe_mode {
-                if state.show_abs {
-                    draw_wireframe_surface(
-                        &plot.samples,
-                        plot.samples_per_axis,
-                        state.domain,
-                        plot.y,
-                        SurfaceKind::Abs,
-                        state.transparent_surfaces,
-                    );
-                }
-                if state.show_imag {
-                    draw_wireframe_surface(
-                        &plot.samples,
-                        plot.samples_per_axis,
-                        state.domain,
-                        plot.y,
-                        SurfaceKind::Imag,
-                        state.transparent_surfaces,
-                    );
-                }
-                if state.show_real {
-                    draw_wireframe_surface(
-                        &plot.samples,
-                        plot.samples_per_axis,
-                        state.domain,
-                        plot.y,
-                        SurfaceKind::Real,
-                        state.transparent_surfaces,
-                    );
+                if state.iso_lines_enabled {
+                    if state.show_abs {
+                        draw_iso_line_segments(
+                            &plot.abs_iso_lines,
+                            SurfaceKind::Abs,
+                            state.transparent_surfaces,
+                        );
+                    }
+                    if state.show_imag {
+                        draw_iso_line_segments(
+                            &plot.imag_iso_lines,
+                            SurfaceKind::Imag,
+                            state.transparent_surfaces,
+                        );
+                    }
+                    if state.show_real {
+                        draw_iso_line_segments(
+                            &plot.real_iso_lines,
+                            SurfaceKind::Real,
+                            state.transparent_surfaces,
+                        );
+                    }
+                } else {
+                    if state.show_abs {
+                        draw_wireframe_surface(
+                            &plot.samples,
+                            plot.samples_per_axis,
+                            state.domain,
+                            plot.y,
+                            SurfaceKind::Abs,
+                            state.transparent_surfaces,
+                        );
+                    }
+                    if state.show_imag {
+                        draw_wireframe_surface(
+                            &plot.samples,
+                            plot.samples_per_axis,
+                            state.domain,
+                            plot.y,
+                            SurfaceKind::Imag,
+                            state.transparent_surfaces,
+                        );
+                    }
+                    if state.show_real {
+                        draw_wireframe_surface(
+                            &plot.samples,
+                            plot.samples_per_axis,
+                            state.domain,
+                            plot.y,
+                            SurfaceKind::Real,
+                            state.transparent_surfaces,
+                        );
+                    }
                 }
             } else {
                 if state.show_abs {
@@ -234,6 +274,30 @@ async fn main() {
                 }
                 if state.show_real {
                     draw_meshes(&plot.real_meshes);
+                }
+
+                if state.iso_lines_enabled {
+                    if state.show_abs {
+                        draw_iso_line_segments(
+                            &plot.abs_iso_lines,
+                            SurfaceKind::Abs,
+                            state.transparent_surfaces,
+                        );
+                    }
+                    if state.show_imag {
+                        draw_iso_line_segments(
+                            &plot.imag_iso_lines,
+                            SurfaceKind::Imag,
+                            state.transparent_surfaces,
+                        );
+                    }
+                    if state.show_real {
+                        draw_iso_line_segments(
+                            &plot.real_iso_lines,
+                            SurfaceKind::Real,
+                            state.transparent_surfaces,
+                        );
+                    }
                 }
             }
             labels = draw_axes_and_ticks(&state.domain, plot);
@@ -399,6 +463,8 @@ struct AppState {
     show_abs: bool,
     transparent_surfaces: bool,
     wireframe_mode: bool,
+    iso_lines_enabled: bool,
+    iso_line_count: usize,
     fullscreen: bool,
     yaw: f32,
     pitch: f32,
@@ -417,10 +483,12 @@ impl AppState {
             self.samples_per_axis,
             visibility,
             self.transparent_surfaces,
+            self.iso_lines_enabled,
+            self.iso_line_count,
         ));
         if let Some(plot) = &self.plot {
             self.status = format!(
-                "domain re=[{}, {}] im=[{}, {}]  y=[{}, {}]  samples: {}x{}  finite: {}/{}  visible: {}{}{}",
+                "domain re=[{}, {}] im=[{}, {}]  y=[{}, {}]  samples: {}x{}  finite: {}/{}  iso: {}({})  visible: {}{}{}",
                 fmt_axis(self.domain.re.min),
                 fmt_axis(self.domain.re.max),
                 fmt_axis(self.domain.im.min),
@@ -431,6 +499,8 @@ impl AppState {
                 self.samples_per_axis,
                 plot.finite_sample_count,
                 plot.total_sample_count,
+                on_off(self.iso_lines_enabled),
+                self.iso_line_count,
                 if self.show_real { "Re " } else { "" },
                 if self.show_imag { "Im " } else { "" },
                 if self.show_abs { "|f|" } else { "" },
@@ -460,6 +530,21 @@ impl AppState {
             return false;
         }
         self.samples_per_axis = next;
+        true
+    }
+
+    fn change_iso_line_count(&mut self, delta: isize) -> bool {
+        let next = if delta < 0 {
+            self.iso_line_count.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.iso_line_count.saturating_add(delta as usize)
+        }
+        .clamp(MIN_ISO_LINE_COUNT, MAX_ISO_LINE_COUNT);
+
+        if next == self.iso_line_count {
+            return false;
+        }
+        self.iso_line_count = next;
         true
     }
 
@@ -499,6 +584,9 @@ struct PlotData {
     real_meshes: Vec<Mesh>,
     imag_meshes: Vec<Mesh>,
     abs_meshes: Vec<Mesh>,
+    real_iso_lines: Vec<(Vec3, Vec3)>,
+    imag_iso_lines: Vec<(Vec3, Vec3)>,
+    abs_iso_lines: Vec<(Vec3, Vec3)>,
     y: Range,
     finite_sample_count: usize,
     total_sample_count: usize,
@@ -539,6 +627,8 @@ fn build_plot(
     samples_per_axis: usize,
     visibility: SurfaceVisibility,
     transparent_surfaces: bool,
+    iso_lines_enabled: bool,
+    iso_line_count: usize,
 ) -> PlotData {
     let n = samples_per_axis;
     assert!(n >= 2);
@@ -547,6 +637,12 @@ fn build_plot(
     let mut samples = vec![Sample::invalid(); n * n];
     let mut y_min = f64::INFINITY;
     let mut y_max = f64::NEG_INFINITY;
+    let mut real_min = f64::INFINITY;
+    let mut real_max = f64::NEG_INFINITY;
+    let mut imag_min = f64::INFINITY;
+    let mut imag_max = f64::NEG_INFINITY;
+    let mut abs_min = f64::INFINITY;
+    let mut abs_max = f64::NEG_INFINITY;
     let mut finite_sample_count = 0;
     let mut visible_value_count = 0usize;
 
@@ -561,6 +657,12 @@ fn build_plot(
             let idx = iz * n + ix;
             if valid {
                 finite_sample_count += 1;
+                real_min = real_min.min(f.re);
+                real_max = real_max.max(f.re);
+                imag_min = imag_min.min(f.im);
+                imag_max = imag_max.max(f.im);
+                abs_min = abs_min.min(abs);
+                abs_max = abs_max.max(abs);
                 if visibility.show_real {
                     y_min = y_min.min(f.re);
                     y_max = y_max.max(f.re);
@@ -634,15 +736,70 @@ fn build_plot(
         Vec::new()
     };
 
+    let real_value_range = finite_range(real_min, real_max);
+    let imag_value_range = finite_range(imag_min, imag_max);
+    let abs_value_range = finite_range(abs_min, abs_max);
+
+    let real_iso_lines = if iso_lines_enabled && visibility.show_real {
+        build_iso_value_lines(
+            &samples,
+            n,
+            domain,
+            y,
+            real_value_range,
+            SurfaceKind::Real,
+            iso_line_count,
+        )
+    } else {
+        Vec::new()
+    };
+    let imag_iso_lines = if iso_lines_enabled && visibility.show_imag {
+        build_iso_value_lines(
+            &samples,
+            n,
+            domain,
+            y,
+            imag_value_range,
+            SurfaceKind::Imag,
+            iso_line_count,
+        )
+    } else {
+        Vec::new()
+    };
+    let abs_iso_lines = if iso_lines_enabled && visibility.show_abs {
+        build_iso_value_lines(
+            &samples,
+            n,
+            domain,
+            y,
+            abs_value_range,
+            SurfaceKind::Abs,
+            iso_line_count,
+        )
+    } else {
+        Vec::new()
+    };
+
     PlotData {
         real_meshes,
         imag_meshes,
         abs_meshes,
+        real_iso_lines,
+        imag_iso_lines,
+        abs_iso_lines,
         y,
         finite_sample_count,
         total_sample_count: n * n,
         samples_per_axis: n,
         samples,
+    }
+}
+
+fn finite_range(min: f64, max: f64) -> Option<Range> {
+    if min.is_finite() && max.is_finite() && (max - min).abs() > 1e-12 {
+        Some(Range { min, max })
+    } else {
+        None
     }
 }
 
@@ -660,6 +817,15 @@ impl SurfaceKind {
             SurfaceKind::Real => Color::new(1.0, 0.04, 0.02, alpha),
             SurfaceKind::Imag => Color::new(0.08, 0.20, 1.0, alpha),
             SurfaceKind::Abs => Color::new(0.05, 0.70, 0.10, alpha),
+        }
+    }
+
+    fn iso_color(self, transparent: bool) -> Color {
+        let alpha = if transparent { 0.88 } else { 1.0 };
+        match self {
+            SurfaceKind::Real => Color::new(0.55, 0.00, 0.00, alpha),
+            SurfaceKind::Imag => Color::new(0.00, 0.03, 0.65, alpha),
+            SurfaceKind::Abs => Color::new(0.00, 0.38, 0.00, alpha),
         }
     }
 
@@ -861,6 +1027,171 @@ fn draw_wireframe_surface(
                 draw_line_3d(a, b, color);
             }
         }
+    }
+}
+
+fn build_iso_value_lines(
+    samples: &[Sample],
+    samples_per_axis: usize,
+    domain: Domain,
+    y_range: Range,
+    value_range: Option<Range>,
+    kind: SurfaceKind,
+    iso_line_count: usize,
+) -> Vec<(Vec3, Vec3)> {
+    let Some(value_range) = value_range else {
+        return Vec::new();
+    };
+
+    if iso_line_count == 0 {
+        return Vec::new();
+    }
+
+    let n = samples_per_axis;
+    let mut segments = Vec::<(Vec3, Vec3)>::new();
+    let eps = (value_range.len().abs() * 1e-12).max(1e-12);
+
+    for iso_index in 1..=iso_line_count {
+        let iso_value =
+            value_range.min + value_range.len() * (iso_index as f64) / ((iso_line_count + 1) as f64);
+
+        for iz in 0..(n - 1) {
+            for ix in 0..(n - 1) {
+                let ia = iz * n + ix;
+                let ib = iz * n + ix + 1;
+                let ic = (iz + 1) * n + ix + 1;
+                let id = (iz + 1) * n + ix;
+
+                let sa = samples[ia];
+                let sb = samples[ib];
+                let sc = samples[ic];
+                let sd = samples[id];
+
+                if !(sa.valid && sb.valid && sc.valid && sd.valid) {
+                    continue;
+                }
+
+                let va = kind.value(sa);
+                let vb = kind.value(sb);
+                let vc = kind.value(sc);
+                let vd = kind.value(sd);
+
+                let cell_min = va.min(vb).min(vc).min(vd);
+                let cell_max = va.max(vb).max(vc).max(vd);
+                if iso_value < cell_min - eps || iso_value > cell_max + eps {
+                    continue;
+                }
+
+                let Some(pa) = sample_world_pos(samples, n, domain, y_range, kind, ix, iz) else {
+                    continue;
+                };
+                let Some(pb) = sample_world_pos(samples, n, domain, y_range, kind, ix + 1, iz) else {
+                    continue;
+                };
+                let Some(pc) =
+                    sample_world_pos(samples, n, domain, y_range, kind, ix + 1, iz + 1)
+                else {
+                    continue;
+                };
+                let Some(pd) = sample_world_pos(samples, n, domain, y_range, kind, ix, iz + 1) else {
+                    continue;
+                };
+
+                let pa = lift_iso_point(pa);
+                let pb = lift_iso_point(pb);
+                let pc = lift_iso_point(pc);
+                let pd = lift_iso_point(pd);
+
+                let mut points = Vec::<Vec3>::with_capacity(4);
+                push_iso_intersection(&mut points, pa, va, pb, vb, iso_value, eps);
+                push_iso_intersection(&mut points, pb, vb, pc, vc, iso_value, eps);
+                push_iso_intersection(&mut points, pc, vc, pd, vd, iso_value, eps);
+                push_iso_intersection(&mut points, pd, vd, pa, va, iso_value, eps);
+
+                match points.len() {
+                    0 | 1 => {}
+                    2 => segments.push((points[0], points[1])),
+                    3 => segments.push((points[0], points[1])),
+                    _ => {
+                        // Ambiguous marching-squares saddle case. Use a center-value
+                        // decider so the contour connectivity is stable across cells.
+                        let center = 0.25 * (va + vb + vc + vd);
+                        let a_high = va >= iso_value;
+                        let center_high = center >= iso_value;
+                        if center_high == a_high {
+                            segments.push((points[0], points[1]));
+                            segments.push((points[2], points[3]));
+                        } else {
+                            segments.push((points[0], points[3]));
+                            segments.push((points[1], points[2]));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    segments
+}
+
+fn push_iso_intersection(
+    points: &mut Vec<Vec3>,
+    p0: Vec3,
+    v0: f64,
+    p1: Vec3,
+    v1: f64,
+    iso_value: f64,
+    eps: f64,
+) {
+    if let Some(point) = iso_intersection(p0, v0, p1, v1, iso_value, eps) {
+        push_unique_iso_point(points, point);
+    }
+}
+
+fn iso_intersection(
+    p0: Vec3,
+    v0: f64,
+    p1: Vec3,
+    v1: f64,
+    iso_value: f64,
+    eps: f64,
+) -> Option<Vec3> {
+    let d0 = v0 - iso_value;
+    let d1 = v1 - iso_value;
+
+    if d0.abs() <= eps && d1.abs() <= eps {
+        return None;
+    }
+    if d0.abs() <= eps {
+        return Some(p0);
+    }
+    if d1.abs() <= eps {
+        return Some(p1);
+    }
+    if (d0 > 0.0 && d1 < 0.0) || (d0 < 0.0 && d1 > 0.0) {
+        let t = (-d0 / (d1 - d0)) as f32;
+        Some(p0 + (p1 - p0) * t)
+    } else {
+        None
+    }
+}
+
+fn push_unique_iso_point(points: &mut Vec<Vec3>, point: Vec3) {
+    const EPS2: f32 = 1e-10;
+    if !points.iter().any(|p| (*p - point).length_squared() <= EPS2) {
+        points.push(point);
+    }
+}
+
+fn lift_iso_point(mut point: Vec3) -> Vec3 {
+    point.y += ISO_LINE_LIFT;
+    point
+}
+
+fn draw_iso_line_segments(segments: &[(Vec3, Vec3)], kind: SurfaceKind, transparent: bool) {
+    let color = kind.iso_color(transparent);
+    for (a, b) in segments {
+        draw_line_3d(*a, *b, color);
     }
 }
 
@@ -1076,12 +1407,14 @@ fn draw_hud(state: &AppState) {
         y += line;
         draw_text(
             &format!(
-                "samples={}x{}  mode={}  alpha={}  fullscreen={}  visible: [1]Re={} [2]Im={} [3]|f|={}",
+                "samples={}x{}  mode={}  alpha={}  fullscreen={}  iso={}({})  visible: [1]Re={} [2]Im={} [3]|f|={}",
                 state.samples_per_axis,
                 state.samples_per_axis,
                 if state.wireframe_mode { "wireframe" } else { "filled" },
                 if state.transparent_surfaces { "0.5" } else { "1.0" },
                 on_off(state.fullscreen),
+                on_off(state.iso_lines_enabled),
+                state.iso_line_count,
                 on_off(state.show_real),
                 on_off(state.show_imag),
                 on_off(state.show_abs),
@@ -1118,6 +1451,7 @@ fn draw_hud(state: &AppState) {
             "N decrease samples by 10%, M increase samples by 10%",
             "1/2/3 toggle Re(f)/Im(f)/|f| visibility",
             "T toggle transparency, F toggle filled vs wireframe",
+            "I toggle iso-value lines, U/O decrease/increase iso-line count",
             "0 reset domain, P save PNG, Esc quit",
         ];
         for item in help {

@@ -40,10 +40,24 @@ If omitted, both domains default to `[-2, 2]`.
 - `1`: toggle Re(f(x))
 - `2`: toggle Im(f(x))
 - `3`: toggle |f(x)|
+- `I`: toggle iso-value lines
+- `U/O`: decrease/increase iso-value line count
 - `P`: save the current view as PNG
 - `F1`: hide/show help overlay
 - `F11`: toggle fullscreen
 - `Esc`: quit
+
+## Iso-value lines
+
+Iso-value lines are contour lines drawn on the currently visible surfaces.
+
+For each visible surface, the program uses that surface's own sampled value range. For example, if `Re(f(x))` ranges from `[0, 10]` and the iso-line count is `4`, the lines are drawn at:
+
+```text
+2, 4, 6, 8
+```
+
+That is, the range is divided into `count + 1` equal intervals and the internal division points are drawn. The default iso-line count is `4`. In filled mode, iso-value lines are drawn as an overlay. In wireframe mode, when iso-value lines are enabled, they replace the regular rectangular grid wireframe.
 
 ## Expression grammar
 
