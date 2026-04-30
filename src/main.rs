@@ -4,18 +4,18 @@ use num_complex::{Complex64, ComplexFloat};
 use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const DEFAULT_SAMPLES_PER_AXIS: usize = 121;
+const DEFAULT_SAMPLES_PER_AXIS: usize = 191;
 const MIN_SAMPLES_PER_AXIS: usize = 5;
 const MAX_SAMPLES_PER_AXIS: usize = 1024;
 const MAX_MESH_SAMPLES_PER_AXIS: usize = 255;
-const DEFAULT_ISO_LINE_COUNT: usize = 4;
+const DEFAULT_ISO_LINE_COUNT: usize = 49;
 const MIN_ISO_LINE_COUNT: usize = 1;
-const MAX_ISO_LINE_COUNT: usize = 64;
+const MAX_ISO_LINE_COUNT: usize = 255;
 const DOMAIN_EXTENT: f32 = 1.55;
 const Y_EXTENT: f32 = 1.25;
 const ISO_LINE_LIFT: f32 = 0.006;
-const AUTO_ROTATE_RADIANS_PER_SEC: f32 = 0.28;
-const MANUAL_ROTATE_RADIANS_PER_SEC: f32 = 1.35;
+const AUTO_ROTATE_RADIANS_PER_SEC: f32 = 0.15;
+const MANUAL_ROTATE_RADIANS_PER_SEC: f32 = 0.95;
 const TRANSPARENT_ALPHA: f32 = 0.50;
 
 type C = Complex64;
