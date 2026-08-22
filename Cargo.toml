@@ -6,3 +6,11 @@ edition = "2021"
 [dependencies]
 macroquad = "0.4.14"
 num-complex = "0.4.6"
+
+# miniquad (macroquad's platform backend) has no FreeBSD support upstream:
+# on FreeBSD its start() compiles to an empty function, so the app exits
+# silently without ever opening a window. We vendor miniquad 0.4.8 with the
+# FreeBSD patch from https://github.com/not-fl3/miniquad/pull/600 applied
+# (extends the Linux X11/EGL backend cfgs to FreeBSD).
+[patch.crates-io]
+miniquad = { path = "third_party/miniquad" }

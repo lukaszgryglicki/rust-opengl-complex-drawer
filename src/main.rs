@@ -2,6 +2,7 @@ use macroquad::camera::Camera;
 use macroquad::prelude::*;
 use num_complex::{Complex64, ComplexFloat};
 use std::env;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_SAMPLES_PER_AXIS: usize = 191;
@@ -19,6 +20,10 @@ const KEY_REPEAT_INTERVAL_SECONDS: f64 = 1.0 / 30.0;
 const AUTO_ROTATE_RADIANS_PER_SEC: f32 = 0.15;
 const MANUAL_ROTATE_RADIANS_PER_SEC: f32 = 0.95;
 const TRANSPARENT_ALPHA: f32 = 0.50;
+const HUE_ANIM_CYCLES_PER_SEC: f32 = 0.10;
+// Relative step sizes for numeric differentiation, scaled by the domain span.
+const DERIV_H1_REL: f64 = 1e-6;
+const DERIV_H2_REL: f64 = 5e-5;
 
 type C = Complex64;
 
@@ -40,8 +45,9 @@ fn window_conf() -> macroquad::conf::Conf {
     }
 }
 
-#[macroquad::main(window_conf)]
-async fn main() {
+fn main() {
+    // Parse CLI and the expression before creating the window, so `--help`,
+    // usage errors and parse errors work without a GPU/display.
     let cli = parse_cli_or_exit();
     let expr = match Parser::parse(&cli.function) {
         Ok(expr) => expr,
@@ -57,6 +63,27 @@ async fn main() {
     println!("Samples: {} x {}", DEFAULT_SAMPLES_PER_AXIS, DEFAULT_SAMPLES_PER_AXIS);
     println!("Press F1 in the window for controls.");
 
+    macroquad::Window::from_config(window_conf(), run_viewer(cli, expr));
+
+    // On a working platform `Window::from_config` blocks until the user quits,
+    // and at least one frame is always rendered first. If we get here without
+    // ever rendering a frame, the platform backend failed to create a window
+    // (it can fail silently, e.g. unsupported OS or no usable display).
+    if !FRAME_RENDERED.load(Ordering::Relaxed) {
+        eprintln!("Error: the graphics backend exited without creating a window.");
+        eprintln!("No frame was ever rendered. Likely causes:");
+        eprintln!("  - no graphical session (DISPLAY/WAYLAND_DISPLAY unset or unreachable)");
+        eprintln!("  - missing X11/EGL runtime libraries (libX11, libXi, libEGL, libGL)");
+        eprintln!("  - an OS without windowing support in the miniquad backend");
+        std::process::exit(1);
+    }
+}
+
+/// Set to `true` on the first rendered frame; used to detect a silent
+/// platform-backend failure (see the check at the end of `main`).
+static FRAME_RENDERED: AtomicBool = AtomicBool::new(false);
+
+async fn run_viewer(cli: Cli, expr: Expr) {
     let mut state = AppState {
         function_text: cli.function.clone(),
         expr,
@@ -73,6 +100,12 @@ async fn main() {
         show_real: true,
         show_imag: true,
         show_abs: true,
+        show_arg: false,
+        color_mode: ColorMode::Solid,
+        hue_anim: false,
+        hue_offset: 0.0,
+        deriv_order: 0,
+        y_scale: YScale::Linear,
         transparent_surfaces: false,
         wireframe_mode: false,
         iso_lines_enabled: false,
@@ -103,6 +136,8 @@ async fn main() {
 
 
     loop {
+        FRAME_RENDERED.store(true, Ordering::Relaxed);
+
         if is_key_pressed(KeyCode::Escape) {
             break;
         }
@@ -172,8 +207,27 @@ async fn main() {
             state.show_abs = !state.show_abs;
             rebuild_plot = true;
         }
+        if is_key_pressed(KeyCode::Key4) {
+            state.show_arg = !state.show_arg;
+            rebuild_plot = true;
+        }
         if is_key_pressed(KeyCode::T) {
             state.transparent_surfaces = !state.transparent_surfaces;
+            state.recolor();
+        }
+        if is_key_pressed(KeyCode::C) {
+            state.color_mode = state.color_mode.next();
+            state.recolor();
+        }
+        if is_key_pressed(KeyCode::B) {
+            state.hue_anim = !state.hue_anim;
+        }
+        if is_key_pressed(KeyCode::V) {
+            state.deriv_order = (state.deriv_order + 1) % 3;
+            rebuild_plot = true;
+        }
+        if is_key_pressed(KeyCode::G) {
+            state.y_scale = state.y_scale.next();
             rebuild_plot = true;
         }
         if is_key_pressed(KeyCode::F) {
@@ -197,6 +251,12 @@ async fn main() {
         let dt = get_frame_time();
         if state.auto_rotate {
             state.yaw += AUTO_ROTATE_RADIANS_PER_SEC * dt;
+        }
+        if state.hue_anim {
+            state.hue_offset = (state.hue_offset + HUE_ANIM_CYCLES_PER_SEC * dt).rem_euclid(1.0);
+            if state.color_mode.uses_hue() && !state.wireframe_mode {
+                state.recolor();
+            }
         }
 
         // View rotation controls: continuous while held.
@@ -227,97 +287,59 @@ async fn main() {
 
         let mut labels = Vec::<(Vec3, String, Color)>::new();
         if let Some(plot) = &state.plot {
+            // Back-to-front-ish fixed order so transparency looks reasonable.
+            let draw_order = [
+                SurfaceKind::Arg,
+                SurfaceKind::Abs,
+                SurfaceKind::Imag,
+                SurfaceKind::Real,
+            ];
             if state.wireframe_mode {
-                if state.iso_lines_enabled {
-                    if state.show_abs {
+                for kind in draw_order {
+                    if !state.is_visible(kind) {
+                        continue;
+                    }
+                    if state.iso_lines_enabled {
                         draw_iso_line_segments(
-                            &plot.abs_iso_lines,
-                            SurfaceKind::Abs,
+                            &plot.surface(kind).iso_lines,
+                            kind,
                             state.transparent_surfaces,
                         );
-                    }
-                    if state.show_imag {
-                        draw_iso_line_segments(
-                            &plot.imag_iso_lines,
-                            SurfaceKind::Imag,
-                            state.transparent_surfaces,
-                        );
-                    }
-                    if state.show_real {
-                        draw_iso_line_segments(
-                            &plot.real_iso_lines,
-                            SurfaceKind::Real,
-                            state.transparent_surfaces,
-                        );
-                    }
-                } else {
-                    if state.show_abs {
+                    } else {
                         draw_wireframe_surface(
                             &plot.samples,
                             plot.samples_per_axis,
                             state.domain,
                             plot.y,
-                            SurfaceKind::Abs,
-                            state.transparent_surfaces,
-                        );
-                    }
-                    if state.show_imag {
-                        draw_wireframe_surface(
-                            &plot.samples,
-                            plot.samples_per_axis,
-                            state.domain,
-                            plot.y,
-                            SurfaceKind::Imag,
-                            state.transparent_surfaces,
-                        );
-                    }
-                    if state.show_real {
-                        draw_wireframe_surface(
-                            &plot.samples,
-                            plot.samples_per_axis,
-                            state.domain,
-                            plot.y,
-                            SurfaceKind::Real,
+                            kind,
+                            plot.surface(kind).value_range,
+                            state.color_mode,
+                            state.y_scale,
+                            state.hue_offset,
                             state.transparent_surfaces,
                         );
                     }
                 }
             } else {
-                if state.show_abs {
-                    draw_meshes(&plot.abs_meshes);
-                }
-                if state.show_imag {
-                    draw_meshes(&plot.imag_meshes);
-                }
-                if state.show_real {
-                    draw_meshes(&plot.real_meshes);
+                for kind in draw_order {
+                    if state.is_visible(kind) {
+                        draw_meshes(&plot.surface(kind).meshes);
+                    }
                 }
 
                 if state.iso_lines_enabled {
-                    if state.show_abs {
-                        draw_iso_line_segments(
-                            &plot.abs_iso_lines,
-                            SurfaceKind::Abs,
-                            state.transparent_surfaces,
-                        );
-                    }
-                    if state.show_imag {
-                        draw_iso_line_segments(
-                            &plot.imag_iso_lines,
-                            SurfaceKind::Imag,
-                            state.transparent_surfaces,
-                        );
-                    }
-                    if state.show_real {
-                        draw_iso_line_segments(
-                            &plot.real_iso_lines,
-                            SurfaceKind::Real,
-                            state.transparent_surfaces,
-                        );
+                    for kind in draw_order {
+                        if state.is_visible(kind) {
+                            draw_iso_line_segments(
+                                &plot.surface(kind).iso_lines,
+                                kind,
+                                state.transparent_surfaces,
+                            );
+                        }
                     }
                 }
             }
-            labels = draw_axes_and_ticks(&state.domain, plot);
+            labels = draw_axes_and_ticks(&state.domain, plot, state.y_scale);
         }
 
         set_default_camera();
@@ -346,6 +368,7 @@ fn parse_cli_or_exit() -> Cli {
         eprintln!("Examples:");
         eprintln!("  complex_surface_viewer \"exp(x)-ln(x)\" -2 2 -2 2");
         eprintln!("  complex_surface_viewer \"sin(x)/x\"");
+        eprintln!("  complex_surface_viewer \"gamma(x)\" -4.5 4.5 -2.5 2.5");
         std::process::exit(if args.is_empty() { 2 } else { 0 });
     }
 
@@ -529,6 +552,12 @@ struct AppState {
     show_real: bool,
     show_imag: bool,
     show_abs: bool,
+    show_arg: bool,
+    color_mode: ColorMode,
+    hue_anim: bool,
+    hue_offset: f32,
+    deriv_order: u8,
+    y_scale: YScale,
     transparent_surfaces: bool,
     wireframe_mode: bool,
     iso_lines_enabled: bool,
@@ -544,35 +573,56 @@ struct AppState {
 
 impl AppState {
     fn rebuild_plot(&mut self) {
-        let visibility = self.visibility();
-        self.plot = Some(build_plot(
+        let plot = build_plot(
             &self.expr,
             self.domain,
             self.samples_per_axis,
-            visibility,
+            self.visibility(),
             self.transparent_surfaces,
             self.iso_lines_enabled,
             self.iso_line_count,
-        ));
-        if let Some(plot) = &self.plot {
-            self.status = format!(
-                "domain re=[{}, {}] im=[{}, {}]  y=[{}, {}]  samples: {}x{}  finite: {}/{}  iso: {}({})  visible: {}{}{}",
-                fmt_axis(self.domain.re.min),
-                fmt_axis(self.domain.re.max),
-                fmt_axis(self.domain.im.min),
-                fmt_axis(self.domain.im.max),
-                fmt_axis(plot.y.min),
-                fmt_axis(plot.y.max),
-                self.samples_per_axis,
-                self.samples_per_axis,
-                plot.finite_sample_count,
-                plot.total_sample_count,
-                on_off(self.iso_lines_enabled),
-                self.iso_line_count,
-                if self.show_real { "Re " } else { "" },
-                if self.show_imag { "Im " } else { "" },
-                if self.show_abs { "|f|" } else { "" },
-            );
+            self.deriv_order,
+            self.y_scale,
+            self.color_mode,
+            self.hue_offset,
+        );
+        self.status = format!(
+            "domain re=[{}, {}] im=[{}, {}]  y=[{}, {}]  samples: {}x{}  finite: {}/{}  iso: {}({})  visible: {}{}{}{}",
+            fmt_axis(self.domain.re.min),
+            fmt_axis(self.domain.re.max),
+            fmt_axis(self.domain.im.min),
+            fmt_axis(self.domain.im.max),
+            fmt_axis(self.y_scale.invert(plot.y.min)),
+            fmt_axis(self.y_scale.invert(plot.y.max)),
+            self.samples_per_axis,
+            self.samples_per_axis,
+            plot.finite_sample_count,
+            plot.total_sample_count,
+            on_off(self.iso_lines_enabled),
+            self.iso_line_count,
+            if self.show_real { "Re " } else { "" },
+            if self.show_imag { "Im " } else { "" },
+            if self.show_abs { "|f| " } else { "" },
+            if self.show_arg { "arg" } else { "" },
+        );
+        self.plot = Some(plot);
+    }
+
+    fn recolor(&mut self) {
+        let mode = self.color_mode;
+        let transparent = self.transparent_surfaces;
+        let hue_offset = self.hue_offset;
+        if let Some(plot) = &mut self.plot {
+            recolor_plot(plot, mode, transparent, hue_offset);
+        }
+    }
+
+    fn is_visible(&self, kind: SurfaceKind) -> bool {
+        match kind {
+            SurfaceKind::Real => self.show_real,
+            SurfaceKind::Imag => self.show_imag,
+            SurfaceKind::Abs => self.show_abs,
+            SurfaceKind::Arg => self.show_arg,
         }
     }
 
@@ -581,6 +631,7 @@ impl AppState {
             show_real: self.show_real,
             show_imag: self.show_imag,
             show_abs: self.show_abs,
+            show_arg: self.show_arg,
         }
     }
 
@@ -649,17 +700,37 @@ impl AppState {
 }
 
 struct PlotData {
-    real_meshes: Vec<Mesh>,
-    imag_meshes: Vec<Mesh>,
-    abs_meshes: Vec<Mesh>,
-    real_iso_lines: Vec<(Vec3, Vec3)>,
-    imag_iso_lines: Vec<(Vec3, Vec3)>,
-    abs_iso_lines: Vec<(Vec3, Vec3)>,
+    surfaces: [SurfaceData; 4],
     y: Range,
     finite_sample_count: usize,
     total_sample_count: usize,
     samples_per_axis: usize,
     samples: Vec<Sample>,
+    center_input: C,
+    center_value: C,
+}
+
+impl PlotData {
+    fn surface(&self, kind: SurfaceKind) -> &SurfaceData {
+        &self.surfaces[kind.index()]
+    }
+}
+
+#[derive(Default)]
+struct SurfaceData {
+    meshes: Vec<Mesh>,
+    // Per mesh, per vertex: color inputs so meshes can be recolored in place
+    // (color-mode change, transparency toggle, hue animation) without re-evaluating f.
+    vertex_infos: Vec<Vec<VertexInfo>>,
+    iso_lines: Vec<(Vec3, Vec3)>,
+    // Transformed (y-scaled) per-surface value range.
+    value_range: Option<Range>,
+}
+
+#[derive(Clone, Copy)]
+struct VertexInfo {
+    sample: u32,
+    value01: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -667,6 +738,7 @@ struct Sample {
     real: f64,
     imag: f64,
     abs: f64,
+    arg: f64,
     valid: bool,
 }
 
@@ -676,6 +748,7 @@ impl Sample {
             real: f64::NAN,
             imag: f64::NAN,
             abs: f64::NAN,
+            arg: f64::NAN,
             valid: false,
         }
     }
@@ -686,9 +759,147 @@ struct SurfaceVisibility {
     show_real: bool,
     show_imag: bool,
     show_abs: bool,
+    show_arg: bool,
+}
+
+impl SurfaceVisibility {
+    fn on(self, kind: SurfaceKind) -> bool {
+        match kind {
+            SurfaceKind::Real => self.show_real,
+            SurfaceKind::Imag => self.show_imag,
+            SurfaceKind::Abs => self.show_abs,
+            SurfaceKind::Arg => self.show_arg,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColorMode {
+    /// One fixed color per surface.
+    Solid,
+    /// Hue encodes arg(f(x)): the classic complex-phase rainbow.
+    Phase,
+    /// Rainbow by surface height, each surface normalized to its own range.
+    Height,
+    /// Domain coloring: phase hue plus brightness rings at each doubling of |f|.
+    Rings,
+}
+
+impl ColorMode {
+    fn next(self) -> Self {
+        match self {
+            ColorMode::Solid => ColorMode::Phase,
+            ColorMode::Phase => ColorMode::Height,
+            ColorMode::Height => ColorMode::Rings,
+            ColorMode::Rings => ColorMode::Solid,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            ColorMode::Solid => "solid",
+            ColorMode::Phase => "phase",
+            ColorMode::Height => "height",
+            ColorMode::Rings => "rings",
+        }
+    }
+
+    fn uses_hue(self) -> bool {
+        !matches!(self, ColorMode::Solid)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum YScale {
+    Linear,
+    /// asinh(y): linear near zero, logarithmic far away; sign-preserving.
+    Arsinh,
+    /// sign(y) * log10(1 + |y|): stronger compression for huge poles.
+    Log10,
+}
+
+impl YScale {
+    fn next(self) -> Self {
+        match self {
+            YScale::Linear => YScale::Arsinh,
+            YScale::Arsinh => YScale::Log10,
+            YScale::Log10 => YScale::Linear,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            YScale::Linear => "linear",
+            YScale::Arsinh => "arsinh",
+            YScale::Log10 => "log10",
+        }
+    }
+
+    fn apply(self, v: f64) -> f64 {
+        match self {
+            YScale::Linear => v,
+            YScale::Arsinh => v.asinh(),
+            YScale::Log10 => {
+                if v >= 0.0 {
+                    (1.0 + v).log10()
+                } else {
+                    -(1.0 - v).log10()
+                }
+            }
+        }
+    }
+
+    fn invert(self, t: f64) -> f64 {
+        match self {
+            YScale::Linear => t,
+            YScale::Arsinh => t.sinh(),
+            YScale::Log10 => {
+                if t >= 0.0 {
+                    10f64.powf(t) - 1.0
+                } else {
+                    -(10f64.powf(-t) - 1.0)
+                }
+            }
+        }
+    }
 }
 
 
+fn eval_target(expr: &Expr, x: C, deriv_order: u8, h: f64) -> C {
+    match deriv_order {
+        0 => expr.eval(x),
+        1 => {
+            // Central difference along the real direction. Exact (up to O(h^2))
+            // for holomorphic f; a directional derivative otherwise.
+            let hc = C::new(h, 0.0);
+            (expr.eval(x + hc) - expr.eval(x - hc)) / C::new(2.0 * h, 0.0)
+        }
+        _ => {
+            let hc = C::new(h, 0.0);
+            (expr.eval(x + hc) - expr.eval(x) * C::new(2.0, 0.0) + expr.eval(x - hc))
+                / C::new(h * h, 0.0)
+        }
+    }
+}
+
+fn deriv_step(domain: Domain, deriv_order: u8) -> f64 {
+    let span = domain.re.len().abs().max(domain.im.len().abs()).max(1e-9);
+    match deriv_order {
+        1 => span * DERIV_H1_REL,
+        2 => span * DERIV_H2_REL,
+        _ => 0.0,
+    }
+}
+
+fn deriv_label(order: u8) -> &'static str {
+    match order {
+        0 => "f",
+        1 => "f'",
+        _ => "f''",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_plot(
     expr: &Expr,
     domain: Domain,
@@ -697,20 +908,21 @@ fn build_plot(
     transparent_surfaces: bool,
     iso_lines_enabled: bool,
     iso_line_count: usize,
+    deriv_order: u8,
+    y_scale: YScale,
+    color_mode: ColorMode,
+    hue_offset: f32,
 ) -> PlotData {
     let n = samples_per_axis;
     assert!(n >= 2);
     let steps = n - 1;
+    let h = deriv_step(domain, deriv_order);
 
     let mut samples = vec![Sample::invalid(); n * n];
     let mut y_min = f64::INFINITY;
     let mut y_max = f64::NEG_INFINITY;
-    let mut real_min = f64::INFINITY;
-    let mut real_max = f64::NEG_INFINITY;
-    let mut imag_min = f64::INFINITY;
-    let mut imag_max = f64::NEG_INFINITY;
-    let mut abs_min = f64::INFINITY;
-    let mut abs_max = f64::NEG_INFINITY;
+    let mut v_min = [f64::INFINITY; 4];
+    let mut v_max = [f64::NEG_INFINITY; 4];
     let mut finite_sample_count = 0;
     let mut visible_value_count = 0usize;
 
@@ -719,39 +931,31 @@ fn build_plot(
         for ix in 0..n {
             let re = lerp_f64(domain.re.min, domain.re.max, ix as f64 / steps as f64);
             let x = C::new(re, im);
-            let f = expr.eval(x);
+            let f = eval_target(expr, x, deriv_order, h);
             let abs = f.norm();
             let valid = f.re.is_finite() && f.im.is_finite() && abs.is_finite();
             let idx = iz * n + ix;
             if valid {
                 finite_sample_count += 1;
-                real_min = real_min.min(f.re);
-                real_max = real_max.max(f.re);
-                imag_min = imag_min.min(f.im);
-                imag_max = imag_max.max(f.im);
-                abs_min = abs_min.min(abs);
-                abs_max = abs_max.max(abs);
-                if visibility.show_real {
-                    y_min = y_min.min(f.re);
-                    y_max = y_max.max(f.re);
-                    visible_value_count += 1;
-                }
-                if visibility.show_imag {
-                    y_min = y_min.min(f.im);
-                    y_max = y_max.max(f.im);
-                    visible_value_count += 1;
-                }
-                if visibility.show_abs {
-                    y_min = y_min.min(abs);
-                    y_max = y_max.max(abs);
-                    visible_value_count += 1;
-                }
-                samples[idx] = Sample {
+                let sample = Sample {
                     real: f.re,
                     imag: f.im,
                     abs,
+                    arg: f.arg(),
                     valid: true,
                 };
+                samples[idx] = sample;
+                for kind in SurfaceKind::ALL {
+                    let tv = y_scale.apply(kind.raw_value(sample));
+                    let k = kind.index();
+                    v_min[k] = v_min[k].min(tv);
+                    v_max[k] = v_max[k].max(tv);
+                    if visibility.on(kind) {
+                        y_min = y_min.min(tv);
+                        y_max = y_max.max(tv);
+                        visible_value_count += 1;
+                    }
+                }
             }
         }
     }
@@ -767,99 +971,58 @@ fn build_plot(
     }
 
     let y = Range { min: y_min, max: y_max };
-    let real_meshes = if visibility.show_real {
-        build_surface_meshes(
-            &samples,
-            n,
-            domain,
-            y,
-            SurfaceKind::Real,
-            transparent_surfaces,
-        )
-    } else {
-        Vec::new()
-    };
-    let imag_meshes = if visibility.show_imag {
-        build_surface_meshes(
-            &samples,
-            n,
-            domain,
-            y,
-            SurfaceKind::Imag,
-            transparent_surfaces,
-        )
-    } else {
-        Vec::new()
-    };
-    let abs_meshes = if visibility.show_abs {
-        build_surface_meshes(
-            &samples,
-            n,
-            domain,
-            y,
-            SurfaceKind::Abs,
-            transparent_surfaces,
-        )
-    } else {
-        Vec::new()
-    };
 
-    let real_value_range = finite_range(real_min, real_max);
-    let imag_value_range = finite_range(imag_min, imag_max);
-    let abs_value_range = finite_range(abs_min, abs_max);
+    let mut surfaces: [SurfaceData; 4] = Default::default();
+    for kind in SurfaceKind::ALL {
+        let k = kind.index();
+        let value_range = finite_range(v_min[k], v_max[k]);
+        let mut surface = SurfaceData {
+            value_range,
+            ..Default::default()
+        };
+        if visibility.on(kind) {
+            let (meshes, vertex_infos) = build_surface_meshes(
+                &samples,
+                n,
+                domain,
+                y,
+                kind,
+                value_range,
+                y_scale,
+                color_mode,
+                hue_offset,
+                transparent_surfaces,
+            );
+            surface.meshes = meshes;
+            surface.vertex_infos = vertex_infos;
+            if iso_lines_enabled {
+                surface.iso_lines = build_iso_value_lines(
+                    &samples,
+                    n,
+                    domain,
+                    y,
+                    value_range,
+                    kind,
+                    y_scale,
+                    iso_line_count,
+                );
+            }
+        }
+        surfaces[k] = surface;
+    }
 
-    let real_iso_lines = if iso_lines_enabled && visibility.show_real {
-        build_iso_value_lines(
-            &samples,
-            n,
-            domain,
-            y,
-            real_value_range,
-            SurfaceKind::Real,
-            iso_line_count,
-        )
-    } else {
-        Vec::new()
-    };
-    let imag_iso_lines = if iso_lines_enabled && visibility.show_imag {
-        build_iso_value_lines(
-            &samples,
-            n,
-            domain,
-            y,
-            imag_value_range,
-            SurfaceKind::Imag,
-            iso_line_count,
-        )
-    } else {
-        Vec::new()
-    };
-    let abs_iso_lines = if iso_lines_enabled && visibility.show_abs {
-        build_iso_value_lines(
-            &samples,
-            n,
-            domain,
-            y,
-            abs_value_range,
-            SurfaceKind::Abs,
-            iso_line_count,
-        )
-    } else {
-        Vec::new()
-    };
+    let center_input = C::new(domain.re.mid(), domain.im.mid());
+    let center_value = eval_target(expr, center_input, deriv_order, h);
 
     PlotData {
-        real_meshes,
-        imag_meshes,
-        abs_meshes,
-        real_iso_lines,
-        imag_iso_lines,
-        abs_iso_lines,
+        surfaces,
         y,
         finite_sample_count,
         total_sample_count: n * n,
         samples_per_axis: n,
         samples,
+        center_input,
+        center_value,
     }
 }
 
@@ -871,20 +1034,38 @@ fn finite_range(min: f64, max: f64) -> Option<Range> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum SurfaceKind {
     Real,
     Imag,
     Abs,
+    Arg,
 }
 
 impl SurfaceKind {
+    const ALL: [SurfaceKind; 4] = [
+        SurfaceKind::Real,
+        SurfaceKind::Imag,
+        SurfaceKind::Abs,
+        SurfaceKind::Arg,
+    ];
+
+    fn index(self) -> usize {
+        match self {
+            SurfaceKind::Real => 0,
+            SurfaceKind::Imag => 1,
+            SurfaceKind::Abs => 2,
+            SurfaceKind::Arg => 3,
+        }
+    }
+
     fn color(self, transparent: bool) -> Color {
         let alpha = if transparent { TRANSPARENT_ALPHA } else { 1.0 };
         match self {
             SurfaceKind::Real => Color::new(1.0, 0.04, 0.02, alpha),
             SurfaceKind::Imag => Color::new(0.08, 0.20, 1.0, alpha),
             SurfaceKind::Abs => Color::new(0.05, 0.70, 0.10, alpha),
+            SurfaceKind::Arg => Color::new(1.0, 0.55, 0.0, alpha),
         }
     }
 
@@ -894,27 +1075,130 @@ impl SurfaceKind {
             SurfaceKind::Real => Color::new(0.55, 0.00, 0.00, alpha),
             SurfaceKind::Imag => Color::new(0.00, 0.03, 0.65, alpha),
             SurfaceKind::Abs => Color::new(0.00, 0.38, 0.00, alpha),
+            SurfaceKind::Arg => Color::new(0.60, 0.30, 0.00, alpha),
         }
     }
 
-    fn value(self, s: Sample) -> f64 {
+    // Per-surface brightness factor so overlapping surfaces stay distinguishable
+    // in the hue-based color modes.
+    fn brightness(self) -> f32 {
+        match self {
+            SurfaceKind::Real => 1.0,
+            SurfaceKind::Imag => 0.75,
+            SurfaceKind::Abs => 0.50,
+            SurfaceKind::Arg => 0.30,
+        }
+    }
+
+    fn raw_value(self, s: Sample) -> f64 {
         match self {
             SurfaceKind::Real => s.real,
             SurfaceKind::Imag => s.imag,
             SurfaceKind::Abs => s.abs,
+            SurfaceKind::Arg => s.arg,
+        }
+    }
+
+    fn value(self, s: Sample, y_scale: YScale) -> f64 {
+        y_scale.apply(self.raw_value(s))
+    }
+}
+
+fn phase01(s: Sample) -> f32 {
+    (((s.arg + std::f64::consts::PI) / std::f64::consts::TAU) as f32).clamp(0.0, 1.0)
+}
+
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
+    let h = h.rem_euclid(1.0) * 6.0;
+    let i = h.floor();
+    let f = h - i;
+    let p = v * (1.0 - s);
+    let q = v * (1.0 - s * f);
+    let t = v * (1.0 - s * (1.0 - f));
+    match (i as i32).rem_euclid(6) {
+        0 => (v, t, p),
+        1 => (q, v, p),
+        2 => (p, v, t),
+        3 => (p, q, v),
+        4 => (t, p, v),
+        _ => (v, p, q),
+    }
+}
+
+fn vertex_color(
+    mode: ColorMode,
+    kind: SurfaceKind,
+    s: Sample,
+    value01: f32,
+    transparent: bool,
+    hue_offset: f32,
+) -> Color {
+    let alpha = if transparent { TRANSPARENT_ALPHA } else { 1.0 };
+    match mode {
+        ColorMode::Solid => kind.color(transparent),
+        ColorMode::Phase => {
+            let hue = phase01(s) + hue_offset;
+            let v = 0.55 + 0.45 * kind.brightness();
+            let (r, g, b) = hsv_to_rgb(hue, 0.85, v);
+            Color::new(r, g, b, alpha)
+        }
+        ColorMode::Height => {
+            // Blue (low) to red (high) rainbow over each surface's own range.
+            let hue = (1.0 - value01.clamp(0.0, 1.0)) * 0.70 + hue_offset;
+            let v = 0.62 + 0.38 * kind.brightness();
+            let (r, g, b) = hsv_to_rgb(hue, 0.88, v);
+            Color::new(r, g, b, alpha)
+        }
+        ColorMode::Rings => {
+            let hue = phase01(s) + hue_offset;
+            let band = if s.abs.is_finite() && s.abs > 0.0 {
+                let l = s.abs.log2();
+                (l - l.floor()) as f32
+            } else {
+                0.0
+            };
+            let v = (0.45 + 0.50 * band) * (0.62 + 0.38 * kind.brightness());
+            let (r, g, b) = hsv_to_rgb(hue, 0.90, v);
+            Color::new(r, g, b, alpha)
         }
     }
 }
 
+fn surface_value01(value_range: Option<Range>, transformed_value: f64) -> f32 {
+    match value_range {
+        Some(r) => (((transformed_value - r.min) / r.len()) as f32).clamp(0.0, 1.0),
+        None => 0.5,
+    }
+}
+
+fn recolor_plot(plot: &mut PlotData, mode: ColorMode, transparent: bool, hue_offset: f32) {
+    for kind in SurfaceKind::ALL {
+        let surface = &mut plot.surfaces[kind.index()];
+        for (mesh, infos) in surface.meshes.iter_mut().zip(surface.vertex_infos.iter()) {
+            for (vertex, info) in mesh.vertices.iter_mut().zip(infos.iter()) {
+                let s = plot.samples[info.sample as usize];
+                vertex.color =
+                    vertex_color(mode, kind, s, info.value01, transparent, hue_offset).into();
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_surface_meshes(
     samples: &[Sample],
     samples_per_axis: usize,
     domain: Domain,
     y_range: Range,
     kind: SurfaceKind,
+    value_range: Option<Range>,
+    y_scale: YScale,
+    color_mode: ColorMode,
+    hue_offset: f32,
     transparent: bool,
-) -> Vec<Mesh> {
+) -> (Vec<Mesh>, Vec<Vec<VertexInfo>>) {
     let mut meshes = Vec::new();
+    let mut vertex_infos = Vec::new();
     let tile_stride = MAX_MESH_SAMPLES_PER_AXIS - 1;
     let mut z0 = 0usize;
 
@@ -923,38 +1207,49 @@ fn build_surface_meshes(
         let mut x0 = 0usize;
         while x0 < samples_per_axis - 1 {
             let x1 = (x0 + tile_stride).min(samples_per_axis - 1);
-            meshes.push(build_surface_mesh_tile(
+            let (mesh, infos) = build_surface_mesh_tile(
                 samples,
                 samples_per_axis,
                 domain,
                 y_range,
                 kind,
+                value_range,
+                y_scale,
+                color_mode,
+                hue_offset,
                 transparent,
                 x0,
                 x1,
                 z0,
                 z1,
-            ));
+            );
+            meshes.push(mesh);
+            vertex_infos.push(infos);
             x0 = x1;
         }
         z0 = z1;
     }
 
-    meshes
+    (meshes, vertex_infos)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_surface_mesh_tile(
     samples: &[Sample],
     samples_per_axis: usize,
     domain: Domain,
     y_range: Range,
     kind: SurfaceKind,
+    value_range: Option<Range>,
+    y_scale: YScale,
+    color_mode: ColorMode,
+    hue_offset: f32,
     transparent: bool,
     x0: usize,
     x1: usize,
     z0: usize,
     z1: usize,
-) -> Mesh {
+) -> (Mesh, Vec<VertexInfo>) {
     let n = samples_per_axis;
     let steps = n - 1;
     let tile_w = x1 - x0 + 1;
@@ -964,7 +1259,7 @@ fn build_surface_mesh_tile(
     assert!(tile_w * tile_h <= u16::MAX as usize);
 
     let mut vertices = Vec::with_capacity(tile_w * tile_h);
-    let color = kind.color(transparent);
+    let mut infos = Vec::with_capacity(tile_w * tile_h);
 
     for lz in 0..tile_h {
         let iz = z0 + lz;
@@ -974,14 +1269,26 @@ fn build_surface_mesh_tile(
             let ix = x0 + lx;
             let re_t = ix as f64 / steps as f64;
             let re = lerp_f64(domain.re.min, domain.re.max, re_t);
-            let sample = samples[iz * n + ix];
-            let y = if sample.valid { kind.value(sample) } else { y_range.min };
+            let sample_idx = iz * n + ix;
+            let sample = samples[sample_idx];
+            let value = if sample.valid {
+                kind.value(sample, y_scale)
+            } else {
+                y_range.min
+            };
+            let value01 = surface_value01(value_range, value);
+            let info = VertexInfo {
+                sample: sample_idx as u32,
+                value01,
+            };
+            let color = vertex_color(color_mode, kind, sample, value01, transparent, hue_offset);
             let pos = vec3(
                 map_re_to_world(domain.re, re),
-                map_y_to_world(y_range, y),
+                map_y_to_world(y_range, value),
                 map_im_to_world(domain.im, im),
             );
             vertices.push(Vertex::new2(pos, vec2(re_t as f32, im_t as f32), color));
+            infos.push(info);
         }
     }
 
@@ -1004,11 +1311,14 @@ fn build_surface_mesh_tile(
         }
     }
 
-    Mesh {
-        vertices,
-        indices,
-        texture: None,
-    }
+    (
+        Mesh {
+            vertices,
+            indices,
+            texture: None,
+        },
+        infos,
+    )
 }
 
 fn draw_meshes(meshes: &[Mesh]) {
@@ -1038,12 +1348,14 @@ fn lerp_f64(a: f64, b: f64, t: f64) -> f64 {
     a + (b - a) * t
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sample_world_pos(
     samples: &[Sample],
     samples_per_axis: usize,
     domain: Domain,
     y_range: Range,
     kind: SurfaceKind,
+    y_scale: YScale,
     ix: usize,
     iz: usize,
 ) -> Option<Vec3> {
@@ -1059,29 +1371,42 @@ fn sample_world_pos(
     let im = lerp_f64(domain.im.min, domain.im.max, im_t);
     Some(vec3(
         map_re_to_world(domain.re, re),
-        map_y_to_world(y_range, kind.value(sample)),
+        map_y_to_world(y_range, kind.value(sample, y_scale)),
         map_im_to_world(domain.im, im),
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_wireframe_surface(
     samples: &[Sample],
     samples_per_axis: usize,
     domain: Domain,
     y_range: Range,
     kind: SurfaceKind,
+    value_range: Option<Range>,
+    color_mode: ColorMode,
+    y_scale: YScale,
+    hue_offset: f32,
     transparent: bool,
 ) {
     let n = samples_per_axis;
-    let color = kind.color(transparent);
+    let solid_color = kind.color(transparent);
+    let color_of = |ix: usize, iz: usize| -> Color {
+        if color_mode == ColorMode::Solid {
+            return solid_color;
+        }
+        let s = samples[iz * n + ix];
+        let value01 = surface_value01(value_range, kind.value(s, y_scale));
+        vertex_color(color_mode, kind, s, value01, transparent, hue_offset)
+    };
 
     for iz in 0..n {
         for ix in 0..(n - 1) {
             if let (Some(a), Some(b)) = (
-                sample_world_pos(samples, n, domain, y_range, kind, ix, iz),
-                sample_world_pos(samples, n, domain, y_range, kind, ix + 1, iz),
+                sample_world_pos(samples, n, domain, y_range, kind, y_scale, ix, iz),
+                sample_world_pos(samples, n, domain, y_range, kind, y_scale, ix + 1, iz),
             ) {
-                draw_line_3d(a, b, color);
+                draw_line_3d(a, b, color_of(ix, iz));
             }
         }
     }
@@ -1089,15 +1414,16 @@ fn draw_wireframe_surface(
     for iz in 0..(n - 1) {
         for ix in 0..n {
             if let (Some(a), Some(b)) = (
-                sample_world_pos(samples, n, domain, y_range, kind, ix, iz),
-                sample_world_pos(samples, n, domain, y_range, kind, ix, iz + 1),
+                sample_world_pos(samples, n, domain, y_range, kind, y_scale, ix, iz),
+                sample_world_pos(samples, n, domain, y_range, kind, y_scale, ix, iz + 1),
             ) {
-                draw_line_3d(a, b, color);
+                draw_line_3d(a, b, color_of(ix, iz));
             }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_iso_value_lines(
     samples: &[Sample],
     samples_per_axis: usize,
@@ -1105,6 +1431,7 @@ fn build_iso_value_lines(
     y_range: Range,
     value_range: Option<Range>,
     kind: SurfaceKind,
+    y_scale: YScale,
     iso_line_count: usize,
 ) -> Vec<(Vec3, Vec3)> {
     let Some(value_range) = value_range else {
@@ -1139,10 +1466,10 @@ fn build_iso_value_lines(
                     continue;
                 }
 
-                let va = kind.value(sa);
-                let vb = kind.value(sb);
-                let vc = kind.value(sc);
-                let vd = kind.value(sd);
+                let va = kind.value(sa, y_scale);
+                let vb = kind.value(sb, y_scale);
+                let vc = kind.value(sc, y_scale);
+                let vd = kind.value(sd, y_scale);
 
                 let cell_min = va.min(vb).min(vc).min(vd);
                 let cell_max = va.max(vb).max(vc).max(vd);
@@ -1150,18 +1477,23 @@ fn build_iso_value_lines(
                     continue;
                 }
 
-                let Some(pa) = sample_world_pos(samples, n, domain, y_range, kind, ix, iz) else {
-                    continue;
-                };
-                let Some(pb) = sample_world_pos(samples, n, domain, y_range, kind, ix + 1, iz) else {
-                    continue;
-                };
-                let Some(pc) =
-                    sample_world_pos(samples, n, domain, y_range, kind, ix + 1, iz + 1)
+                let Some(pa) = sample_world_pos(samples, n, domain, y_range, kind, y_scale, ix, iz)
                 else {
                     continue;
                 };
-                let Some(pd) = sample_world_pos(samples, n, domain, y_range, kind, ix, iz + 1) else {
+                let Some(pb) =
+                    sample_world_pos(samples, n, domain, y_range, kind, y_scale, ix + 1, iz)
+                else {
+                    continue;
+                };
+                let Some(pc) =
+                    sample_world_pos(samples, n, domain, y_range, kind, y_scale, ix + 1, iz + 1)
+                else {
+                    continue;
+                };
+                let Some(pd) =
+                    sample_world_pos(samples, n, domain, y_range, kind, y_scale, ix, iz + 1)
+                else {
                     continue;
                 };
 
@@ -1263,7 +1595,7 @@ fn draw_iso_line_segments(segments: &[(Vec3, Vec3)], kind: SurfaceKind, transpar
     }
 }
 
-fn draw_axes_and_ticks(domain: &Domain, plot: &PlotData) -> Vec<(Vec3, String, Color)> {
+fn draw_axes_and_ticks(domain: &Domain, plot: &PlotData, y_scale: YScale) -> Vec<(Vec3, String, Color)> {
     let zero_y = if plot.y.contains(0.0) {
         map_y_to_world(plot.y, 0.0)
     } else {
@@ -1383,7 +1715,7 @@ fn draw_axes_and_ticks(domain: &Domain, plot: &PlotData) -> Vec<(Vec3, String, C
         let y = map_y_to_world(plot.y, value);
         labels.push((
             vec3(y_axis_x + 0.10, y, y_axis_z),
-            fmt_axis(value),
+            fmt_axis(y_scale.invert(value)),
             Color::new(0.0, 0.0, 0.0, 1.0),
         ));
     }
@@ -1400,7 +1732,10 @@ fn draw_axes_and_ticks(domain: &Domain, plot: &PlotData) -> Vec<(Vec3, String, C
     ));
     labels.push((
         vec3(y_axis_x + 0.10, Y_EXTENT + 0.03, y_axis_z),
-        "Re(f), Im(f), |f|".to_owned(),
+        match y_scale {
+            YScale::Linear => "Re(f), Im(f), |f|, arg(f)".to_owned(),
+            _ => format!("Re(f), Im(f), |f|, arg(f) [{}]", y_scale.label()),
+        },
         Color::new(0.0, 0.0, 0.0, 1.0),
     ));
 
@@ -1448,7 +1783,14 @@ fn draw_hud(state: &AppState) {
     let line = 22.0;
 
     draw_text(
-        &format!("f(x) = {}", state.function_text),
+        &format!(
+            "f(x) = {}{}",
+            state.function_text,
+            match state.deriv_order {
+                0 => String::new(),
+                o => format!("   [showing {}(x), numeric]", deriv_label(o)),
+            }
+        ),
         14.0,
         y,
         font_size,
@@ -1464,8 +1806,8 @@ fn draw_hud(state: &AppState) {
                 fmt_axis(state.domain.re.max),
                 fmt_axis(state.domain.im.min),
                 fmt_axis(state.domain.im.max),
-                fmt_axis(plot.y.min),
-                fmt_axis(plot.y.max)
+                fmt_axis(state.y_scale.invert(plot.y.min)),
+                fmt_axis(state.y_scale.invert(plot.y.max))
             ),
             14.0,
             y,
@@ -1475,17 +1817,20 @@ fn draw_hud(state: &AppState) {
         y += line;
         draw_text(
             &format!(
-                "samples={}x{}  mode={}  alpha={}  fullscreen={}  iso={}({})  visible: [1]Re={} [2]Im={} [3]|f|={}",
+                "samples={}x{}  mode={}  alpha={}  color={}  yscale={}  anim={}  iso={}({})  [1]Re={} [2]Im={} [3]|f|={} [4]arg={}",
                 state.samples_per_axis,
                 state.samples_per_axis,
                 if state.wireframe_mode { "wireframe" } else { "filled" },
                 if state.transparent_surfaces { "0.5" } else { "1.0" },
-                on_off(state.fullscreen),
+                state.color_mode.label(),
+                state.y_scale.label(),
+                on_off(state.hue_anim),
                 on_off(state.iso_lines_enabled),
                 state.iso_line_count,
                 on_off(state.show_real),
                 on_off(state.show_imag),
                 on_off(state.show_abs),
+                on_off(state.show_arg),
             ),
             14.0,
             y,
@@ -1493,15 +1838,41 @@ fn draw_hud(state: &AppState) {
             BLACK,
         );
         y += line;
+
+        let g = deriv_label(state.deriv_order);
+        let cv = plot.center_value;
+        let probe = if cv.re.is_finite() && cv.im.is_finite() {
+            format!(
+                "at center x = {} + {}i:  {} = {} + {}i   |{}| = {}   arg({}) = {}",
+                fmt_axis(plot.center_input.re),
+                fmt_axis(plot.center_input.im),
+                g,
+                fmt_axis(cv.re),
+                fmt_axis(cv.im),
+                g,
+                fmt_axis(cv.norm()),
+                g,
+                fmt_axis(cv.arg()),
+            )
+        } else {
+            format!(
+                "at center x = {} + {}i:  {} is not finite",
+                fmt_axis(plot.center_input.re),
+                fmt_axis(plot.center_input.im),
+                g,
+            )
+        };
+        draw_text(&probe, 14.0, y, font_size, BLACK);
+        y += line;
     }
 
-    draw_text(
-        "red: Re(f)   blue: Im(f)   green: |f|",
-        14.0,
-        y,
-        font_size,
-        BLACK,
-    );
+    let legend = match state.color_mode {
+        ColorMode::Solid => "red: Re(f)   blue: Im(f)   green: |f|   orange: arg(f)",
+        ColorMode::Phase => "hue: arg(f(x)) rainbow (-pi..pi)   brightness: Re > Im > |f| > arg",
+        ColorMode::Height => "rainbow by height, per surface range (blue: low, red: high)",
+        ColorMode::Rings => "hue: arg(f(x))   brightness rings: one ring per doubling of |f|",
+    };
+    draw_text(legend, 14.0, y, font_size, BLACK);
     y += line;
 
     if !state.status.is_empty() {
@@ -1517,8 +1888,12 @@ fn draw_hud(state: &AppState) {
             "Z expand domain by 1.1, X shrink domain by 1.1",
             "H/L move real domain -/+ 10%, J/K move imag domain -/+ 10%",
             "N decrease samples by 10%, M increase samples by 10%",
-            "1/2/3 toggle Re(f)/Im(f)/|f| visibility",
+            "1/2/3/4 toggle Re(f)/Im(f)/|f|/arg(f) visibility",
             "T toggle transparency, F toggle filled vs wireframe",
+            "C cycle color mode: solid / phase / height / rings",
+            "B toggle rainbow hue animation (phase/height/rings modes)",
+            "V cycle derivative: f / f' / f'' (numeric, on the fly)",
+            "G cycle vertical scale: linear / arsinh / log10",
             "I toggle iso-value lines, U/O decrease/increase iso-line count",
             "0 reset domain, P save PNG, Esc quit",
         ];
@@ -1726,7 +2101,41 @@ fn eval_function(name: &str, args: &[Expr], x: C) -> C {
             if a.norm() >= b.norm() { a } else { b }
         }
         "avg" => (args[0].eval(x) + args[1].eval(x)) / two,
+        "gamma" | "tgamma" => complex_gamma(args[0].eval(x)),
+        "factorial" | "fact" => complex_gamma(args[0].eval(x) + one),
         _ => C::new(f64::NAN, f64::NAN), // unreachable after parser validation
+    }
+}
+
+// Gamma function via the Lanczos approximation (g = 7, n = 9), with the
+// reflection formula for Re(z) < 0.5.
+fn complex_gamma(z: C) -> C {
+    // Canonical published Lanczos coefficients; keep full literature precision.
+    #[allow(clippy::excessive_precision)]
+    const COEF: [f64; 9] = [
+        0.99999999999980993,
+        676.5203681218851,
+        -1259.1392167224028,
+        771.32342877765313,
+        -176.61502916214059,
+        12.507343278686905,
+        -0.13857109526572012,
+        9.9843695780195716e-6,
+        1.5056327351493116e-7,
+    ];
+    const G: f64 = 7.0;
+    let pi = std::f64::consts::PI;
+    if z.re < 0.5 {
+        let pi_c = C::new(pi, 0.0);
+        pi_c / ((pi_c * z).sin() * complex_gamma(C::new(1.0, 0.0) - z))
+    } else {
+        let z = z - C::new(1.0, 0.0);
+        let mut x = C::new(COEF[0], 0.0);
+        for (i, &c) in COEF.iter().enumerate().skip(1) {
+            x += C::new(c, 0.0) / (z + C::new(i as f64, 0.0));
+        }
+        let t = z + C::new(G + 0.5, 0.0);
+        C::new((2.0 * pi).sqrt(), 0.0) * t.powc(z + C::new(0.5, 0.0)) * (-t).exp() * x
     }
 }
 
@@ -2208,6 +2617,10 @@ fn is_function_name(name: &str) -> bool {
             | "minabs"
             | "maxabs"
             | "avg"
+            | "gamma"
+            | "tgamma"
+            | "factorial"
+            | "fact"
     )
 }
 
@@ -2223,7 +2636,8 @@ fn validate_function(name: &str, arity: usize) -> Result<(), String> {
         | "tan" | "asin" | "arcsin" | "acos" | "arccos" | "atan" | "arctan" | "sinh"
         | "cosh" | "tanh" | "asinh" | "arcsinh" | "acosh" | "arccosh" | "atanh"
         | "arctanh" | "sec" | "csc" | "cot" | "sech" | "csch" | "coth" | "floor"
-        | "ceil" | "round" | "trunc" | "frac" | "fract" => arity == 1,
+        | "ceil" | "round" | "trunc" | "frac" | "fract" | "gamma" | "tgamma"
+        | "factorial" | "fact" => arity == 1,
         "pow" | "powc" | "powf" | "powi" | "powu" | "root" | "scale" | "unscale"
         | "fdiv" | "complex" | "rect" | "new" | "polar" | "from_polar" | "minabs"
         | "maxabs" | "avg" | "expf" => arity == 2,
@@ -2235,5 +2649,206 @@ fn validate_function(name: &str, arity: usize) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("wrong number of arguments for `{name}`: got {arity}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn eval_str(input: &str, x: C) -> C {
+        Parser::parse(input).expect("parse failed").eval(x)
+    }
+
+    fn assert_close(actual: C, expected: C, tol: f64) {
+        assert!(
+            (actual - expected).norm() <= tol,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn parses_operator_precedence() {
+        assert_close(eval_str("2+3*4", C::new(0.0, 0.0)), C::new(14.0, 0.0), 1e-12);
+        assert_close(eval_str("(2+3)*4", C::new(0.0, 0.0)), C::new(20.0, 0.0), 1e-12);
+        assert_close(eval_str("2^3^2", C::new(0.0, 0.0)), C::new(512.0, 0.0), 1e-9);
+        assert_close(eval_str("-2^2", C::new(0.0, 0.0)), C::new(-4.0, 0.0), 1e-12);
+        assert_close(eval_str("6/3/2", C::new(0.0, 0.0)), C::new(1.0, 0.0), 1e-12);
+    }
+
+    #[test]
+    fn parses_implicit_multiplication() {
+        let x = C::new(3.0, 0.0);
+        assert_close(eval_str("2x", x), C::new(6.0, 0.0), 1e-12);
+        assert_close(eval_str("(x+1)(x-1)", x), C::new(8.0, 0.0), 1e-12);
+        assert_close(eval_str("2sin(0)x", x), C::new(0.0, 0.0), 1e-12);
+        assert_close(eval_str("3(2)", C::new(0.0, 0.0)), C::new(6.0, 0.0), 1e-12);
+    }
+
+    #[test]
+    fn parses_constants_and_variables() {
+        let x = C::new(1.5, -0.5);
+        assert_close(eval_str("x", x), x, 0.0);
+        assert_close(eval_str("z", x), x, 0.0);
+        assert_close(eval_str("i*j", x), C::new(-1.0, 0.0), 1e-12);
+        assert_close(eval_str("pi", x), C::new(std::f64::consts::PI, 0.0), 1e-12);
+        assert_close(eval_str("e", x), C::new(std::f64::consts::E, 0.0), 1e-12);
+    }
+
+    #[test]
+    fn rejects_invalid_expressions() {
+        assert!(Parser::parse("").is_err());
+        assert!(Parser::parse("2+").is_err());
+        assert!(Parser::parse("sin()").is_err());
+        assert!(Parser::parse("sin(x,x)").is_err());
+        assert!(Parser::parse("unknownfn(x)").is_err());
+        assert!(Parser::parse("bogus").is_err());
+        assert!(Parser::parse("(x").is_err());
+        assert!(Parser::parse("x)").is_err());
+    }
+
+    #[test]
+    fn evaluates_complex_identities() {
+        let x = C::new(0.7, 0.3);
+        // e^(i*pi) = -1
+        assert_close(eval_str("exp(i*pi)", x), C::new(-1.0, 0.0), 1e-12);
+        // sin^2 + cos^2 = 1 holds for complex arguments.
+        assert_close(eval_str("sin(x)^2+cos(x)^2", x), C::new(1.0, 0.0), 1e-9);
+        // ln(exp(x)) = x within the principal branch.
+        assert_close(eval_str("ln(exp(x))", x), x, 1e-12);
+        assert_close(eval_str("conj(x)", x), C::new(0.7, -0.3), 1e-12);
+        assert_close(eval_str("re(x)+i*im(x)", x), x, 1e-12);
+        assert_close(eval_str("abs(3+4i)", x), C::new(5.0, 0.0), 1e-12);
+    }
+
+    #[test]
+    fn evaluates_gamma() {
+        let x = C::new(0.0, 0.0);
+        // gamma(n) = (n-1)!
+        assert_close(eval_str("gamma(5)", x), C::new(24.0, 0.0), 1e-9);
+        assert_close(eval_str("gamma(1)", x), C::new(1.0, 0.0), 1e-12);
+        // gamma(1/2) = sqrt(pi)
+        assert_close(
+            eval_str("gamma(0.5)", x),
+            C::new(std::f64::consts::PI.sqrt(), 0.0),
+            1e-10,
+        );
+        // Reflection-formula branch: gamma(-0.5) = -2*sqrt(pi)
+        assert_close(
+            eval_str("gamma(-0.5)", x),
+            C::new(-2.0 * std::f64::consts::PI.sqrt(), 0.0),
+            1e-9,
+        );
+        // factorial(n) = gamma(n+1)
+        assert_close(eval_str("factorial(4)", x), C::new(24.0, 0.0), 1e-9);
+        // |gamma(i)|^2 = pi / sinh(pi)
+        let g_i = eval_str("gamma(i)", x);
+        let expected = std::f64::consts::PI / std::f64::consts::PI.sinh();
+        assert!((g_i.norm_sqr() - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn numeric_derivatives_match_analytic() {
+        let expr = Parser::parse("x^3").unwrap();
+        let domain = Domain {
+            re: Range::new(-2.0, 2.0).unwrap(),
+            im: Range::new(-2.0, 2.0).unwrap(),
+        };
+        let x = C::new(1.0, 1.0);
+        let h1 = deriv_step(domain, 1);
+        let h2 = deriv_step(domain, 2);
+        // d/dx x^3 = 3x^2 -> 3(1+i)^2 = 6i
+        assert_close(eval_target(&expr, x, 1, h1), C::new(0.0, 6.0), 1e-6);
+        // d2/dx2 x^3 = 6x -> 6+6i
+        assert_close(eval_target(&expr, x, 2, h2), C::new(6.0, 6.0), 1e-4);
+
+        let expr = Parser::parse("exp(x)").unwrap();
+        let x = C::new(0.5, -0.25);
+        let expected = x.exp();
+        assert_close(eval_target(&expr, x, 1, h1), expected, 1e-6);
+        assert_close(eval_target(&expr, x, 2, h2), expected, 1e-4);
+    }
+
+    #[test]
+    fn y_scale_roundtrips() {
+        for scale in [YScale::Linear, YScale::Arsinh, YScale::Log10] {
+            for v in [-1e6, -12.5, -1.0, -1e-9, 0.0, 1e-9, 0.5, 3.0, 1e8] {
+                let t = scale.apply(v);
+                assert!(t.is_finite());
+                let back = scale.invert(t);
+                let tol = 1e-9 * v.abs().max(1.0);
+                assert!(
+                    (back - v).abs() <= tol,
+                    "{} roundtrip failed for {v}: got {back}",
+                    scale.label()
+                );
+            }
+            // Monotonicity and sign preservation.
+            assert!(scale.apply(-2.0) < scale.apply(-1.0));
+            assert!(scale.apply(1.0) < scale.apply(2.0));
+            assert_eq!(scale.apply(0.0), 0.0);
+        }
+    }
+
+    #[test]
+    fn hsv_to_rgb_is_sane() {
+        let (r, g, b) = hsv_to_rgb(0.0, 1.0, 1.0);
+        assert!((r - 1.0).abs() < 1e-6 && g.abs() < 1e-6 && b.abs() < 1e-6);
+        let (r, g, b) = hsv_to_rgb(1.0 / 3.0, 1.0, 1.0);
+        assert!(r.abs() < 1e-6 && (g - 1.0).abs() < 1e-6 && b.abs() < 1e-6);
+        // Hue wraps around.
+        let a = hsv_to_rgb(0.25, 0.8, 0.9);
+        let b2 = hsv_to_rgb(1.25, 0.8, 0.9);
+        assert!((a.0 - b2.0).abs() < 1e-5 && (a.1 - b2.1).abs() < 1e-5 && (a.2 - b2.2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn iso_intersection_finds_crossings() {
+        let p0 = vec3(0.0, 0.0, 0.0);
+        let p1 = vec3(1.0, 0.0, 0.0);
+        let hit = iso_intersection(p0, 0.0, p1, 1.0, 0.5, 1e-12).unwrap();
+        assert!((hit.x - 0.5).abs() < 1e-6);
+        assert!(iso_intersection(p0, 0.0, p1, 1.0, 2.0, 1e-12).is_none());
+    }
+
+    #[test]
+    fn build_plot_handles_poles() {
+        let expr = Parser::parse("1/x").unwrap();
+        let domain = Domain {
+            re: Range::new(-1.0, 1.0).unwrap(),
+            im: Range::new(-1.0, 1.0).unwrap(),
+        };
+        let visibility = SurfaceVisibility {
+            show_real: true,
+            show_imag: true,
+            show_abs: true,
+            show_arg: true,
+        };
+        // Odd sample count puts a sample exactly on the pole at 0.
+        let plot = build_plot(
+            &expr,
+            domain,
+            21,
+            visibility,
+            false,
+            true,
+            4,
+            0,
+            YScale::Arsinh,
+            ColorMode::Rings,
+            0.0,
+        );
+        assert_eq!(plot.total_sample_count, 441);
+        assert!(plot.finite_sample_count < plot.total_sample_count);
+        assert!(plot.finite_sample_count > 0);
+        assert!(plot.y.min < plot.y.max);
+        for kind in SurfaceKind::ALL {
+            let surface = plot.surface(kind);
+            assert!(!surface.meshes.is_empty());
+            assert_eq!(surface.meshes.len(), surface.vertex_infos.len());
+            for (mesh, infos) in surface.meshes.iter().zip(surface.vertex_infos.iter()) {
+                assert_eq!(mesh.vertices.len(), infos.len());
+            }
+        }
     }
 }
