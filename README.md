@@ -22,6 +22,22 @@ re_min re_max im_min im_max
 
 If omitted, both domains default to `[-2, 2]`.
 
+Options (all optional, may appear anywhere among the positional arguments):
+
+| Option              | Meaning                                                                                                  |
+|---------------------|----------------------------------------------------------------------------------------------------------|
+| `--color=MODE`      | initial color mode: `solid` (default), `phase`, `height`, `rings` or `4d`                                |
+| `--show=LIST`       | initially visible surfaces, comma-separated subset of `re,im,abs,arg` (default `re,im,abs`)              |
+| `--colormap=SPEC`   | color map used by the `4d` mode, see [Color map](#color-map); `@FILE` reads the spec from a file          |
+| `--screenshot=FILE` | render one frame, save it as PNG to `FILE` and exit (handy for scripting / headless checks under Xvfb)   |
+| `-h`, `--help`      | print usage, including the default color map spec                                                        |
+| `--`                | end of options; only needed for an expression that itself starts with `--`, e.g. `-- "--x"`              |
+
+```bash
+cargo run --release -- --color=4d --show=re "x^2"
+cargo run --release -- --color=4d --show=abs --colormap="3,(0,0,0),(1,0,0),(1,1,1)" "1/x"
+```
+
 ## Controls
 
 - `R`: stop/start automatic rotation
@@ -41,8 +57,10 @@ If omitted, both domains default to `[-2, 2]`.
 - `2`: toggle Im(f(x))
 - `3`: toggle |f(x)|
 - `4`: toggle arg(f(x))
-- `C`: cycle color mode: `solid` / `phase` / `height` / `rings`
-- `B`: toggle rainbow hue animation (in `phase`, `height` and `rings` modes)
+- `5`: swap visibility of `Re(f) <-> Im(f)` and `|f| <-> arg(f)` (in `4d` mode this
+  flips "surface `Re` colored by `Im`" into "surface `Im` colored by `Re`" and back)
+- `C`: cycle color mode: `solid` / `phase` / `height` / `rings` / `4d`
+- `B`: toggle rainbow hue animation (in `phase`, `height`, `rings` and `4d` modes)
 - `V`: cycle derivative view: `f` / `f'` / `f''` (numeric, computed on the fly)
 - `G`: cycle vertical scale: `linear` / `arsinh` / `log10`
 - `I`: toggle iso-value lines
@@ -68,11 +86,12 @@ real-valued surfaces over the complex domain plane, toggled with `1`-`4`:
 
 All visible surfaces share one vertical axis range. The HUD shows the value
 of the currently displayed function (or derivative) at the domain center:
-`re + im i`, modulus and argument.
+`re + im i`, modulus and argument. To see both components of `f(x)` on one
+surface, use the [4D mode](#4d-mode).
 
 ## Color modes
 
-`C` cycles four coloring styles; they apply to filled surfaces and wireframes:
+`C` cycles five coloring styles; they apply to filled surfaces and wireframes:
 
 - `solid`: one fixed color per surface (see table above).
 - `phase`: hue encodes `arg(f(x))` as a rainbow over `(-pi, pi]` — the classic
@@ -82,10 +101,86 @@ of the currently displayed function (or derivative) at the domain center:
   normalized to its own value range.
 - `rings`: domain coloring — hue encodes phase and brightness bands form one
   ring per doubling of `|f(x)|`, so zeros and poles show as ring bullseyes.
+- `4d`: the surface height stays one component of `f(x)` and its color encodes
+  the *other* one, so a single surface shows all four dimensions. See
+  [4D mode](#4d-mode).
 
-`B` animates the hue (a slowly rotating rainbow) in the three hue-based modes.
+`B` animates the hue (a slowly rotating rainbow) in the four hue-based modes.
 Colors are recomputed in place without re-evaluating the function, but with
 very large sample grids the per-frame recolor can still be noticeable.
+
+## 4D mode
+
+A complex function is a map `R^2 -> R^2`, i.e. a 4D graph. The `4d` color mode
+(`C` until the HUD says `color=4d`, or start with `--color=4d`) folds the 4th
+dimension into color:
+
+- the domain plane is `Re(x)`, `Im(x)` as usual,
+- the height of each visible surface is its own component, as in every other mode,
+- the color of a surface point is that surface's *paired* component at the same
+  `x`: `Re(f)` is colored by `Im(f)`, `Im(f)` by `Re(f)`, `|f|` by `arg(f)`
+  and `arg(f)` by `|f|`.
+
+The colored component is normalized linearly from its minimum to its maximum
+over the sampled grid (under the current vertical scale, so `G` also affects
+the coloring near poles) and looked up in the [color map](#color-map). The HUD
+shows one color bar per visible surface with the true `min` and `max` values of
+the colored component at its ends.
+
+To view a single colored surface start with `--color=4d --show=re` (or use
+`1`-`4` to leave one surface on). `5` swaps `Re <-> Im` (and `|f| <-> arg`)
+visibility, flipping between "`Re(f)` surface colored by `Im(f)`" and "`Im(f)`
+surface colored by `Re(f)`" with one key. Everything else keeps working in this
+mode: `N`/`M` grid density, `F` wireframe (grid lines take the map colors, so a
+sparse grid shows the colored structure), `I`/`U`/`O` iso-value lines (drawn
+neutral dark gray on top of a filled surface, colored by the map in wireframe
+mode where there is no surface underneath), `T` transparency, `G` vertical
+scale, `V` derivatives and `B` hue animation, which slides the cyclic color map
+along the value range.
+
+```bash
+cargo run --release -- --color=4d --show=re "x^2"         # saddle x^2-y^2 colored by 2xy
+cargo run --release -- --color=4d --show=im "sin(x)"
+cargo run --release -- --color=4d --show=abs "gamma(x)" -4.5 4.5 -2.5 2.5   # |gamma| colored by arg
+```
+
+## Color map
+
+The `4d` mode maps the normalized colored component `t in [0, 1]` through a
+piecewise-linear color map. The default has 13 evenly spaced stops:
+
+```text
+gray -> black -> violet -> indigo -> blue -> teal -> green -> yellow -> orange -> red -> pink -> white -> gray
+```
+
+so `min` is black (after a short gray lead-in) and `max` is white. Both ends are
+gray, which makes the map cyclic: the `B` hue animation and the wrap from `max`
+back to `min` have no visible seam.
+
+A custom map is given with `--colormap=SPEC` (or `--colormap=@FILE` to read
+`SPEC` from a file), where
+
+```text
+SPEC = "N,(r,g,b),(r,g,b),...,(r,g,b)"
+```
+
+- `N` is the number of stops (`>= 2`) and exactly `N` tuples must follow,
+- each tuple is `(red, green, blue)` with components in `0..1`,
+- the stops are spread evenly from `min` (first stop) to `max` (last stop),
+- separators between tuples are lenient: commas and/or whitespace, or none.
+
+Repeat the first stop as the last one if you want the map to stay seamless
+under `B` animation. The default map, printed by `--help`, is:
+
+```text
+13,(0.5,0.5,0.5),(0,0,0),(0.36,0,0.55),(0.3,0.05,0.8),(0.05,0.35,1),(0,0.7,0.7),(0,0.85,0.1),(1,1,0),(1,0.55,0),(1,0.05,0.05),(1,0.45,0.75),(1,1,1),(0.5,0.5,0.5)
+```
+
+Example: a simple black -> red -> white ramp
+
+```bash
+cargo run --release -- --color=4d --show=abs --colormap="3,(0,0,0),(1,0,0),(1,1,1)" "1/x"
+```
 
 ## Derivative view
 
@@ -120,7 +215,7 @@ For each visible surface, the program uses that surface's own sampled value rang
 2, 4, 6, 8
 ```
 
-That is, the range is divided into `count + 1` equal intervals and the internal division points are drawn. The default iso-line count is `99`. In filled mode, iso-value lines are drawn as an overlay. In wireframe mode, when iso-value lines are enabled, they replace the regular rectangular grid wireframe.
+That is, the range is divided into `count + 1` equal intervals and the internal division points are drawn. The default iso-line count is `99`. In filled mode, iso-value lines are drawn as an overlay. In wireframe mode, when iso-value lines are enabled, they replace the regular rectangular grid wireframe. In the `4d` color mode the overlay lines are neutral dark gray, while the wireframe-mode contours are colored by the [color map](#color-map) like the surface they trace.
 
 The iso-line count can be adjusted from `1` to `255`.
 
@@ -150,7 +245,8 @@ cargo test
 ```
 
 covers the expression parser/evaluator, gamma, numeric derivatives,
-vertical-scale transforms and plot building around poles.
+vertical-scale transforms, plot building around poles, the `4d` coloring and
+its color-map parser, and the command-line options.
 
 ## FreeBSD support
 

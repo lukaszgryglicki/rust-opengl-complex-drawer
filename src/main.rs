@@ -24,8 +24,173 @@ const HUE_ANIM_CYCLES_PER_SEC: f32 = 0.10;
 // Relative step sizes for numeric differentiation, scaled by the domain span.
 const DERIV_H1_REL: f64 = 1e-6;
 const DERIV_H2_REL: f64 = 5e-5;
+// Frames rendered before `--screenshot` captures the window (lets the window settle).
+const SCREENSHOT_FRAME: u32 = 3;
+
+// Default color map of the `4d` color mode: evenly spaced stops over [0, 1]
+// (min..max of the color component). Both ends are the same gray so that the
+// map is cyclic: shifting it (hue animation) has no seam. Override with
+// `--colormap="N,(r,g,b),...(r,g,b)"`.
+const DEFAULT_COLORMAP_STOPS: [(f32, f32, f32); 13] = [
+    (0.50, 0.50, 0.50), // gray
+    (0.00, 0.00, 0.00), // black
+    (0.36, 0.00, 0.55), // violet
+    (0.30, 0.05, 0.80), // indigo
+    (0.05, 0.35, 1.00), // blue
+    (0.00, 0.70, 0.70), // teal
+    (0.00, 0.85, 0.10), // green
+    (1.00, 1.00, 0.00), // yellow
+    (1.00, 0.55, 0.00), // orange
+    (1.00, 0.05, 0.05), // red
+    (1.00, 0.45, 0.75), // pink
+    (1.00, 1.00, 1.00), // white
+    (0.50, 0.50, 0.50), // gray
+];
 
 type C = Complex64;
+
+/// Color map of the `4d` color mode: N evenly spaced RGB stops over [0, 1],
+/// linearly interpolated in between.
+#[derive(Clone, Debug, PartialEq)]
+struct ColorMap {
+    stops: Vec<(f32, f32, f32)>,
+}
+
+impl Default for ColorMap {
+    fn default() -> Self {
+        Self {
+            stops: DEFAULT_COLORMAP_STOPS.to_vec(),
+        }
+    }
+}
+
+impl ColorMap {
+    /// Parses `"N,(r,g,b),(r,g,b),..."`: N (at least 2) stops with components in
+    /// `0..=1`, evenly spaced from the minimum to the maximum of the color
+    /// component. Separators between stops may be commas and/or whitespace.
+    fn parse(spec: &str) -> Result<Self, String> {
+        let Some(first_paren) = spec.find('(') else {
+            return Err("color map must look like \"N,(r,g,b),(r,g,b),...\"".to_owned());
+        };
+        let count_text = spec[..first_paren].trim().trim_end_matches(',').trim();
+        let count: usize = count_text.parse().map_err(|_| {
+            format!("color map must start with the number of stops, got '{count_text}'")
+        })?;
+        if count < 2 {
+            return Err(format!("color map needs at least 2 stops, got {count}"));
+        }
+
+        // `count` is unvalidated user input, so do not size an allocation from it.
+        let mut stops = Vec::new();
+        let mut rest = spec[first_paren..].trim_start_matches(|c: char| c.is_whitespace() || c == ',');
+        while !rest.is_empty() {
+            if stops.len() == count {
+                return Err(format!(
+                    "color map declares {count} stops but lists more (at '{}')",
+                    excerpt(rest)
+                ));
+            }
+            let Some(inner) = rest.strip_prefix('(') else {
+                return Err(format!("expected '(' at '{}' in color map", excerpt(rest)));
+            };
+            let Some(close) = inner.find(')') else {
+                return Err(format!("missing ')' at '{}' in color map", excerpt(rest)));
+            };
+            let tuple = &inner[..close];
+            let parts: Vec<&str> = tuple.split(',').map(str::trim).collect();
+            if parts.len() != 3 {
+                return Err(format!("color map stop '({tuple})' must have 3 components (r,g,b)"));
+            }
+            let mut rgb = [0.0f32; 3];
+            for (component, part) in rgb.iter_mut().zip(parts.iter()) {
+                let value: f32 = part.parse().map_err(|_| {
+                    format!("invalid number '{part}' in color map stop '({tuple})'")
+                })?;
+                if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                    return Err(format!(
+                        "component {value} in color map stop '({tuple})' is outside 0..=1"
+                    ));
+                }
+                *component = value;
+            }
+            stops.push((rgb[0], rgb[1], rgb[2]));
+            rest = inner[close + 1..].trim_start_matches(|c: char| c.is_whitespace() || c == ',');
+        }
+
+        if stops.len() != count {
+            return Err(format!(
+                "color map declares {count} stops but lists {}",
+                stops.len()
+            ));
+        }
+        Ok(Self { stops })
+    }
+
+    /// Reads the spec from a file when `arg` starts with `@`, otherwise parses `arg` itself.
+    fn from_cli_arg(arg: &str) -> Result<Self, String> {
+        match arg.strip_prefix('@') {
+            Some(path) => {
+                let spec = std::fs::read_to_string(path)
+                    .map_err(|err| format!("cannot read color map file '{path}': {err}"))?;
+                Self::parse(&spec).map_err(|err| format!("{err} (in '{path}')"))
+            }
+            None => Self::parse(arg),
+        }
+    }
+
+    /// The spec string that reproduces this map (the format accepted by `parse`).
+    fn to_spec(&self) -> String {
+        let stops: Vec<String> = self
+            .stops
+            .iter()
+            .map(|(r, g, b)| format!("({r},{g},{b})"))
+            .collect();
+        format!("{},{}", self.stops.len(), stops.join(","))
+    }
+
+    /// Piecewise-linear interpolation between the stops: `0` is the first stop and
+    /// `1` the last. Values outside `[0, 1]` (hue-animation offsets) wrap modulo 1,
+    /// which is seamless whenever the first and last stops are equal (as in the default).
+    fn color(&self, t: f32) -> (f32, f32, f32) {
+        let t = if !t.is_finite() {
+            0.0
+        } else if (0.0..=1.0).contains(&t) {
+            t
+        } else {
+            t.rem_euclid(1.0)
+        };
+        let segments = self.stops.len() - 1;
+        let x = t * segments as f32;
+        let i = (x.floor() as usize).min(segments - 1);
+        let f = x - i as f32;
+        let (r0, g0, b0) = self.stops[i];
+        let (r1, g1, b1) = self.stops[i + 1];
+        (
+            r0 + (r1 - r0) * f,
+            g0 + (g1 - g0) * f,
+            b0 + (b1 - b0) * f,
+        )
+    }
+}
+
+fn excerpt(text: &str) -> String {
+    let short: String = text.chars().take(24).collect();
+    if short.len() < text.len() {
+        format!("{short}...")
+    } else {
+        short
+    }
+}
+
+/// Per-vertex color inputs shared by mesh building, in-place recoloring and
+/// wireframe drawing.
+#[derive(Clone, Copy)]
+struct Shading<'a> {
+    mode: ColorMode,
+    hue_offset: f32,
+    transparent: bool,
+    colormap: &'a ColorMap,
+}
 
 fn window_conf() -> macroquad::conf::Conf {
     macroquad::conf::Conf {
@@ -84,6 +249,8 @@ fn main() {
 static FRAME_RENDERED: AtomicBool = AtomicBool::new(false);
 
 async fn run_viewer(cli: Cli, expr: Expr) {
+    let mut screenshot_path = cli.screenshot.clone();
+    let mut frame_index: u32 = 0;
     let mut state = AppState {
         function_text: cli.function.clone(),
         expr,
@@ -97,11 +264,12 @@ async fn run_viewer(cli: Cli, expr: Expr) {
         },
         plot: None,
         samples_per_axis: DEFAULT_SAMPLES_PER_AXIS,
-        show_real: true,
-        show_imag: true,
-        show_abs: true,
-        show_arg: false,
-        color_mode: ColorMode::Solid,
+        show_real: cli.visibility.show_real,
+        show_imag: cli.visibility.show_imag,
+        show_abs: cli.visibility.show_abs,
+        show_arg: cli.visibility.show_arg,
+        color_mode: cli.color_mode,
+        colormap: cli.colormap.clone(),
         hue_anim: false,
         hue_offset: 0.0,
         deriv_order: 0,
@@ -211,6 +379,13 @@ async fn run_viewer(cli: Cli, expr: Expr) {
             state.show_arg = !state.show_arg;
             rebuild_plot = true;
         }
+        if is_key_pressed(KeyCode::Key5) {
+            // Swap visibility Re<->Im and |f|<->arg: in the `4d` color mode this
+            // flips "Re surface colored by Im" into "Im surface colored by Re".
+            std::mem::swap(&mut state.show_real, &mut state.show_imag);
+            std::mem::swap(&mut state.show_abs, &mut state.show_arg);
+            rebuild_plot = true;
+        }
         if is_key_pressed(KeyCode::T) {
             state.transparent_surfaces = !state.transparent_surfaces;
             state.recolor();
@@ -287,6 +462,7 @@ async fn run_viewer(cli: Cli, expr: Expr) {
 
         let mut labels = Vec::<(Vec3, String, Color)>::new();
         if let Some(plot) = &state.plot {
+            let shading = state.shading();
             // Back-to-front-ish fixed order so transparency looks reasonable.
             let draw_order = [
                 SurfaceKind::Arg,
@@ -300,11 +476,7 @@ async fn run_viewer(cli: Cli, expr: Expr) {
                         continue;
                     }
                     if state.iso_lines_enabled {
-                        draw_iso_line_segments(
-                            &plot.surface(kind).iso_lines,
-                            kind,
-                            state.transparent_surfaces,
-                        );
+                        draw_iso_line_segments(&plot.surface(kind).iso_lines, kind, shading, false);
                     } else {
                         draw_wireframe_surface(
                             &plot.samples,
@@ -313,10 +485,9 @@ async fn run_viewer(cli: Cli, expr: Expr) {
                             plot.y,
                             kind,
                             plot.surface(kind).value_range,
-                            state.color_mode,
+                            plot.surface(kind.partner()).value_range,
                             state.y_scale,
-                            state.hue_offset,
-                            state.transparent_surfaces,
+                            shading,
                         );
                     }
                 }
@@ -330,11 +501,7 @@ async fn run_viewer(cli: Cli, expr: Expr) {
                 if state.iso_lines_enabled {
                     for kind in draw_order {
                         if state.is_visible(kind) {
-                            draw_iso_line_segments(
-                                &plot.surface(kind).iso_lines,
-                                kind,
-                                state.transparent_surfaces,
-                            );
+                            draw_iso_line_segments(&plot.surface(kind).iso_lines, kind, shading, true);
                         }
                     }
                 }
@@ -350,63 +517,132 @@ async fn run_viewer(cli: Cli, expr: Expr) {
 
         if is_key_pressed(KeyCode::P) {
             let filename = format!("complex_view_{}.png", unix_timestamp_seconds());
-            get_screen_data().export_png(&filename);
+            save_screenshot(&filename);
             state.status = format!("saved {filename}");
-            println!("Saved screenshot to {filename}");
         }
+
+        // `--screenshot=FILE`: capture once the window has settled, then quit.
+        if frame_index >= SCREENSHOT_FRAME {
+            if let Some(path) = screenshot_path.take() {
+                save_screenshot(&path);
+                break;
+            }
+        }
+        frame_index = frame_index.saturating_add(1);
 
         next_frame().await;
     }
 }
 
+fn save_screenshot(path: &str) {
+    get_screen_data().export_png(path);
+    println!("Saved screenshot to {path}");
+}
+
 fn parse_cli_or_exit() -> Cli {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "-h" || arg == "--help") || args.is_empty() {
-        eprintln!("Usage:");
-        eprintln!("  complex_surface_viewer \"exp(x)-ln(x)\" [re_min re_max im_min im_max]");
-        eprintln!();
-        eprintln!("Examples:");
-        eprintln!("  complex_surface_viewer \"exp(x)-ln(x)\" -2 2 -2 2");
-        eprintln!("  complex_surface_viewer \"sin(x)/x\"");
-        eprintln!("  complex_surface_viewer \"gamma(x)\" -4.5 4.5 -2.5 2.5");
+        print_usage();
         std::process::exit(if args.is_empty() { 2 } else { 0 });
     }
 
-    if args.len() != 1 && args.len() != 5 {
-        eprintln!("Expected either 1 argument or 5 arguments.");
-        eprintln!("Usage: complex_surface_viewer \"f(x)\" [re_min re_max im_min im_max]");
+    parse_cli(&args).unwrap_or_else(|err| {
+        eprintln!("{err}");
+        eprintln!();
+        print_usage();
         std::process::exit(2);
+    })
+}
+
+fn print_usage() {
+    eprintln!("Usage:");
+    eprintln!("  complex_surface_viewer [options] \"exp(x)-ln(x)\" [re_min re_max im_min im_max]");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  --color=MODE       initial color mode: solid, phase, height, rings, 4d (default: solid)");
+    eprintln!("  --show=LIST        initially visible surfaces, comma-separated subset of re,im,abs,arg");
+    eprintln!("                     (default: re,im,abs)");
+    eprintln!("  --colormap=SPEC    color map of the 4d mode: \"N,(r,g,b),...,(r,g,b)\" with N stops");
+    eprintln!("                     (components 0..1) spread evenly from min to max of the colored");
+    eprintln!("                     component; use @FILE to read SPEC from a file. Default:");
+    eprintln!("                     \"{}\"", ColorMap::default().to_spec());
+    eprintln!("  --screenshot=FILE  render one frame, save it as PNG to FILE and exit");
+    eprintln!("  -h, --help         show this help");
+    eprintln!("  --                 end of options (needed only for expressions starting with \"--\")");
+    eprintln!();
+    eprintln!("Examples:");
+    eprintln!("  complex_surface_viewer \"exp(x)-ln(x)\" -2 2 -2 2");
+    eprintln!("  complex_surface_viewer \"sin(x)/x\"");
+    eprintln!("  complex_surface_viewer \"gamma(x)\" -4.5 4.5 -2.5 2.5");
+    eprintln!("  complex_surface_viewer --color=4d --show=re \"x^2\"");
+    eprintln!("  complex_surface_viewer --color=4d --show=abs --colormap=\"3,(0,0,0),(1,0,0),(1,1,1)\" \"1/x\"");
+}
+
+fn parse_cli(args: &[String]) -> Result<Cli, String> {
+    let mut color_mode = ColorMode::Solid;
+    let mut visibility = SurfaceVisibility::default();
+    let mut colormap = ColorMap::default();
+    let mut screenshot = None;
+    let mut positional = Vec::<&str>::new();
+    let mut options_done = false;
+
+    for arg in args {
+        if options_done {
+            positional.push(arg.as_str());
+        } else if arg == "--" {
+            // Conventional end of options; lets expressions such as "--x" through.
+            options_done = true;
+        } else if let Some(value) = arg.strip_prefix("--color=") {
+            color_mode = ColorMode::from_cli_name(value)
+                .ok_or_else(|| format!("Unknown color mode '{value}' (expected solid, phase, height, rings or 4d)"))?;
+        } else if let Some(value) = arg.strip_prefix("--show=") {
+            visibility = SurfaceVisibility::from_cli_list(value)?;
+        } else if let Some(value) = arg.strip_prefix("--colormap=") {
+            colormap = ColorMap::from_cli_arg(value).map_err(|err| format!("Invalid --colormap: {err}"))?;
+        } else if let Some(value) = arg.strip_prefix("--screenshot=") {
+            if value.is_empty() {
+                return Err("--screenshot requires a file name".to_owned());
+            }
+            screenshot = Some(value.to_owned());
+        } else if arg.starts_with("--") {
+            return Err(format!("Unknown option '{arg}'"));
+        } else {
+            positional.push(arg.as_str());
+        }
     }
 
-    let re = if args.len() == 5 {
-        Range::new(parse_f64_arg(&args[1], "re_min"), parse_f64_arg(&args[2], "re_max"))
-            .unwrap_or_else(|err| fatal(&err))
+    if positional.len() != 1 && positional.len() != 5 {
+        return Err(format!(
+            "Expected either 1 or 5 positional arguments, got {}.",
+            positional.len()
+        ));
+    }
+
+    let (re, im) = if positional.len() == 5 {
+        (
+            Range::new(parse_f64_arg(positional[1], "re_min")?, parse_f64_arg(positional[2], "re_max")?)?,
+            Range::new(parse_f64_arg(positional[3], "im_min")?, parse_f64_arg(positional[4], "im_max")?)?,
+        )
     } else {
-        Range::new(-2.0, 2.0).unwrap()
+        (Range::new(-2.0, 2.0)?, Range::new(-2.0, 2.0)?)
     };
 
-    let im = if args.len() == 5 {
-        Range::new(parse_f64_arg(&args[3], "im_min"), parse_f64_arg(&args[4], "im_max"))
-            .unwrap_or_else(|err| fatal(&err))
-    } else {
-        Range::new(-2.0, 2.0).unwrap()
-    };
-
-    Cli {
-        function: args[0].clone(),
+    Ok(Cli {
+        function: positional[0].to_owned(),
         re,
         im,
-    }
+        color_mode,
+        visibility,
+        colormap,
+        screenshot,
+    })
 }
 
-fn parse_f64_arg(s: &str, name: &str) -> f64 {
+fn parse_f64_arg(s: &str, name: &str) -> Result<f64, String> {
     s.parse::<f64>()
-        .unwrap_or_else(|_| fatal(&format!("{name} must be a finite floating-point number")))
-}
-
-fn fatal<T>(message: &str) -> T {
-    eprintln!("{message}");
-    std::process::exit(2);
+        .ok()
+        .filter(|v| v.is_finite())
+        .ok_or_else(|| format!("{name} must be a finite floating-point number, got '{s}'"))
 }
 
 #[derive(Clone)]
@@ -414,6 +650,10 @@ struct Cli {
     function: String,
     re: Range,
     im: Range,
+    color_mode: ColorMode,
+    visibility: SurfaceVisibility,
+    colormap: ColorMap,
+    screenshot: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -554,6 +794,7 @@ struct AppState {
     show_abs: bool,
     show_arg: bool,
     color_mode: ColorMode,
+    colormap: ColorMap,
     hue_anim: bool,
     hue_offset: f32,
     deriv_order: u8,
@@ -572,19 +813,26 @@ struct AppState {
 }
 
 impl AppState {
+    fn shading(&self) -> Shading<'_> {
+        Shading {
+            mode: self.color_mode,
+            hue_offset: self.hue_offset,
+            transparent: self.transparent_surfaces,
+            colormap: &self.colormap,
+        }
+    }
+
     fn rebuild_plot(&mut self) {
         let plot = build_plot(
             &self.expr,
             self.domain,
             self.samples_per_axis,
             self.visibility(),
-            self.transparent_surfaces,
+            self.shading(),
             self.iso_lines_enabled,
             self.iso_line_count,
             self.deriv_order,
             self.y_scale,
-            self.color_mode,
-            self.hue_offset,
         );
         self.status = format!(
             "domain re=[{}, {}] im=[{}, {}]  y=[{}, {}]  samples: {}x{}  finite: {}/{}  iso: {}({})  visible: {}{}{}{}",
@@ -609,11 +857,15 @@ impl AppState {
     }
 
     fn recolor(&mut self) {
-        let mode = self.color_mode;
-        let transparent = self.transparent_surfaces;
-        let hue_offset = self.hue_offset;
+        // Built inline (not via `shading()`) so `plot` can be borrowed mutably alongside.
+        let shading = Shading {
+            mode: self.color_mode,
+            hue_offset: self.hue_offset,
+            transparent: self.transparent_surfaces,
+            colormap: &self.colormap,
+        };
         if let Some(plot) = &mut self.plot {
-            recolor_plot(plot, mode, transparent, hue_offset);
+            recolor_plot(plot, shading);
         }
     }
 
@@ -722,15 +974,29 @@ struct SurfaceData {
     // Per mesh, per vertex: color inputs so meshes can be recolored in place
     // (color-mode change, transparency toggle, hue animation) without re-evaluating f.
     vertex_infos: Vec<Vec<VertexInfo>>,
-    iso_lines: Vec<(Vec3, Vec3)>,
+    iso_lines: Vec<IsoSegment>,
     // Transformed (y-scaled) per-surface value range.
     value_range: Option<Range>,
+}
+
+/// One marching-squares contour piece on a surface.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct IsoSegment {
+    a: Vec3,
+    b: Vec3,
+    /// Paired component (see `SurfaceKind::partner`) normalized to its range, averaged
+    /// over the segment; lets the `4d` mode color contours when no surface is drawn.
+    color01: f32,
 }
 
 #[derive(Clone, Copy)]
 struct VertexInfo {
     sample: u32,
+    /// This surface's own value, normalized to its sampled range.
     value01: f32,
+    /// The paired component (Re<->Im, |f|<->arg), normalized to its sampled range;
+    /// the color source in the `4d` color mode.
+    color01: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -754,12 +1020,23 @@ impl Sample {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct SurfaceVisibility {
     show_real: bool,
     show_imag: bool,
     show_abs: bool,
     show_arg: bool,
+}
+
+impl Default for SurfaceVisibility {
+    fn default() -> Self {
+        Self {
+            show_real: true,
+            show_imag: true,
+            show_abs: true,
+            show_arg: false,
+        }
+    }
 }
 
 impl SurfaceVisibility {
@@ -771,9 +1048,33 @@ impl SurfaceVisibility {
             SurfaceKind::Arg => self.show_arg,
         }
     }
+
+    /// Parses a `--show=` list such as `re,im` or `abs`.
+    fn from_cli_list(list: &str) -> Result<Self, String> {
+        let mut visibility = Self {
+            show_real: false,
+            show_imag: false,
+            show_abs: false,
+            show_arg: false,
+        };
+        for name in list.split(',').map(str::trim).filter(|name| !name.is_empty()) {
+            match SurfaceKind::from_cli_name(name) {
+                Some(SurfaceKind::Real) => visibility.show_real = true,
+                Some(SurfaceKind::Imag) => visibility.show_imag = true,
+                Some(SurfaceKind::Abs) => visibility.show_abs = true,
+                Some(SurfaceKind::Arg) => visibility.show_arg = true,
+                None => {
+                    return Err(format!(
+                        "Unknown surface '{name}' in --show (expected a comma-separated subset of re,im,abs,arg)"
+                    ))
+                }
+            }
+        }
+        Ok(visibility)
+    }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ColorMode {
     /// One fixed color per surface.
     Solid,
@@ -783,6 +1084,10 @@ enum ColorMode {
     Height,
     /// Domain coloring: phase hue plus brightness rings at each doubling of |f|.
     Rings,
+    /// 4D view: color encodes the paired component (Re<->Im, |f|<->arg) along the
+    /// cyclic spectrum in `SPECTRUM_STOPS`, normalized to that component's range.
+    /// With a single surface visible this shows all four dimensions at once.
+    FourD,
 }
 
 impl ColorMode {
@@ -791,7 +1096,8 @@ impl ColorMode {
             ColorMode::Solid => ColorMode::Phase,
             ColorMode::Phase => ColorMode::Height,
             ColorMode::Height => ColorMode::Rings,
-            ColorMode::Rings => ColorMode::Solid,
+            ColorMode::Rings => ColorMode::FourD,
+            ColorMode::FourD => ColorMode::Solid,
         }
     }
 
@@ -801,6 +1107,18 @@ impl ColorMode {
             ColorMode::Phase => "phase",
             ColorMode::Height => "height",
             ColorMode::Rings => "rings",
+            ColorMode::FourD => "4d",
+        }
+    }
+
+    fn from_cli_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "solid" => Some(ColorMode::Solid),
+            "phase" => Some(ColorMode::Phase),
+            "height" => Some(ColorMode::Height),
+            "rings" => Some(ColorMode::Rings),
+            "4d" => Some(ColorMode::FourD),
+            _ => None,
         }
     }
 
@@ -905,13 +1223,11 @@ fn build_plot(
     domain: Domain,
     samples_per_axis: usize,
     visibility: SurfaceVisibility,
-    transparent_surfaces: bool,
+    shading: Shading,
     iso_lines_enabled: bool,
     iso_line_count: usize,
     deriv_order: u8,
     y_scale: YScale,
-    color_mode: ColorMode,
-    hue_offset: f32,
 ) -> PlotData {
     let n = samples_per_axis;
     assert!(n >= 2);
@@ -972,10 +1288,16 @@ fn build_plot(
 
     let y = Range { min: y_min, max: y_max };
 
+    // Every surface's range is needed up front: in the `4d` color mode a surface
+    // is colored by its partner component, normalized to the partner's range.
+    let value_ranges: [Option<Range>; 4] =
+        std::array::from_fn(|k| finite_range(v_min[k], v_max[k]));
+
     let mut surfaces: [SurfaceData; 4] = Default::default();
     for kind in SurfaceKind::ALL {
         let k = kind.index();
-        let value_range = finite_range(v_min[k], v_max[k]);
+        let value_range = value_ranges[k];
+        let color_range = value_ranges[kind.partner().index()];
         let mut surface = SurfaceData {
             value_range,
             ..Default::default()
@@ -988,10 +1310,9 @@ fn build_plot(
                 y,
                 kind,
                 value_range,
+                color_range,
                 y_scale,
-                color_mode,
-                hue_offset,
-                transparent_surfaces,
+                shading,
             );
             surface.meshes = meshes;
             surface.vertex_infos = vertex_infos;
@@ -1002,6 +1323,7 @@ fn build_plot(
                     domain,
                     y,
                     value_range,
+                    color_range,
                     kind,
                     y_scale,
                     iso_line_count,
@@ -1034,7 +1356,7 @@ fn finite_range(min: f64, max: f64) -> Option<Range> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SurfaceKind {
     Real,
     Imag,
@@ -1056,6 +1378,36 @@ impl SurfaceKind {
             SurfaceKind::Imag => 1,
             SurfaceKind::Abs => 2,
             SurfaceKind::Arg => 3,
+        }
+    }
+
+    /// The component shown as color on this surface in the `4d` color mode:
+    /// Re<->Im (Cartesian pair) and |f|<->arg (polar pair).
+    fn partner(self) -> SurfaceKind {
+        match self {
+            SurfaceKind::Real => SurfaceKind::Imag,
+            SurfaceKind::Imag => SurfaceKind::Real,
+            SurfaceKind::Abs => SurfaceKind::Arg,
+            SurfaceKind::Arg => SurfaceKind::Abs,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            SurfaceKind::Real => "Re(f)",
+            SurfaceKind::Imag => "Im(f)",
+            SurfaceKind::Abs => "|f|",
+            SurfaceKind::Arg => "arg(f)",
+        }
+    }
+
+    fn from_cli_name(name: &str) -> Option<SurfaceKind> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "re" | "real" => Some(SurfaceKind::Real),
+            "im" | "imag" => Some(SurfaceKind::Imag),
+            "abs" | "mod" | "modulus" => Some(SurfaceKind::Abs),
+            "arg" | "phase" => Some(SurfaceKind::Arg),
+            _ => None,
         }
     }
 
@@ -1125,14 +1477,13 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
     }
 }
 
-fn vertex_color(
-    mode: ColorMode,
-    kind: SurfaceKind,
-    s: Sample,
-    value01: f32,
-    transparent: bool,
-    hue_offset: f32,
-) -> Color {
+fn vertex_color(shading: Shading, kind: SurfaceKind, s: Sample, value01: f32, color01: f32) -> Color {
+    let Shading {
+        mode,
+        hue_offset,
+        transparent,
+        colormap,
+    } = shading;
     let alpha = if transparent { TRANSPARENT_ALPHA } else { 1.0 };
     match mode {
         ColorMode::Solid => kind.color(transparent),
@@ -1161,6 +1512,12 @@ fn vertex_color(
             let (r, g, b) = hsv_to_rgb(hue, 0.90, v);
             Color::new(r, g, b, alpha)
         }
+        ColorMode::FourD => {
+            // The paired component drives the color; the hue offset shifts the
+            // (cyclic) map, so the animation sweeps the spectrum over the surface.
+            let (r, g, b) = colormap.color(color01.clamp(0.0, 1.0) + hue_offset);
+            Color::new(r, g, b, alpha)
+        }
     }
 }
 
@@ -1171,14 +1528,21 @@ fn surface_value01(value_range: Option<Range>, transformed_value: f64) -> f32 {
     }
 }
 
-fn recolor_plot(plot: &mut PlotData, mode: ColorMode, transparent: bool, hue_offset: f32) {
+/// Normalized paired-component value of a sample, the color source of the `4d` mode.
+fn sample_color01(kind: SurfaceKind, s: Sample, color_range: Option<Range>, y_scale: YScale) -> f32 {
+    if !s.valid {
+        return 0.0;
+    }
+    surface_value01(color_range, kind.partner().value(s, y_scale))
+}
+
+fn recolor_plot(plot: &mut PlotData, shading: Shading) {
     for kind in SurfaceKind::ALL {
         let surface = &mut plot.surfaces[kind.index()];
         for (mesh, infos) in surface.meshes.iter_mut().zip(surface.vertex_infos.iter()) {
             for (vertex, info) in mesh.vertices.iter_mut().zip(infos.iter()) {
                 let s = plot.samples[info.sample as usize];
-                vertex.color =
-                    vertex_color(mode, kind, s, info.value01, transparent, hue_offset).into();
+                vertex.color = vertex_color(shading, kind, s, info.value01, info.color01).into();
             }
         }
     }
@@ -1192,10 +1556,9 @@ fn build_surface_meshes(
     y_range: Range,
     kind: SurfaceKind,
     value_range: Option<Range>,
+    color_range: Option<Range>,
     y_scale: YScale,
-    color_mode: ColorMode,
-    hue_offset: f32,
-    transparent: bool,
+    shading: Shading,
 ) -> (Vec<Mesh>, Vec<Vec<VertexInfo>>) {
     let mut meshes = Vec::new();
     let mut vertex_infos = Vec::new();
@@ -1214,10 +1577,9 @@ fn build_surface_meshes(
                 y_range,
                 kind,
                 value_range,
+                color_range,
                 y_scale,
-                color_mode,
-                hue_offset,
-                transparent,
+                shading,
                 x0,
                 x1,
                 z0,
@@ -1241,10 +1603,9 @@ fn build_surface_mesh_tile(
     y_range: Range,
     kind: SurfaceKind,
     value_range: Option<Range>,
+    color_range: Option<Range>,
     y_scale: YScale,
-    color_mode: ColorMode,
-    hue_offset: f32,
-    transparent: bool,
+    shading: Shading,
     x0: usize,
     x1: usize,
     z0: usize,
@@ -1277,11 +1638,13 @@ fn build_surface_mesh_tile(
                 y_range.min
             };
             let value01 = surface_value01(value_range, value);
+            let color01 = sample_color01(kind, sample, color_range, y_scale);
             let info = VertexInfo {
                 sample: sample_idx as u32,
                 value01,
+                color01,
             };
-            let color = vertex_color(color_mode, kind, sample, value01, transparent, hue_offset);
+            let color = vertex_color(shading, kind, sample, value01, color01);
             let pos = vec3(
                 map_re_to_world(domain.re, re),
                 map_y_to_world(y_range, value),
@@ -1384,20 +1747,20 @@ fn draw_wireframe_surface(
     y_range: Range,
     kind: SurfaceKind,
     value_range: Option<Range>,
-    color_mode: ColorMode,
+    color_range: Option<Range>,
     y_scale: YScale,
-    hue_offset: f32,
-    transparent: bool,
+    shading: Shading,
 ) {
     let n = samples_per_axis;
-    let solid_color = kind.color(transparent);
+    let solid_color = kind.color(shading.transparent);
     let color_of = |ix: usize, iz: usize| -> Color {
-        if color_mode == ColorMode::Solid {
+        if shading.mode == ColorMode::Solid {
             return solid_color;
         }
         let s = samples[iz * n + ix];
         let value01 = surface_value01(value_range, kind.value(s, y_scale));
-        vertex_color(color_mode, kind, s, value01, transparent, hue_offset)
+        let color01 = sample_color01(kind, s, color_range, y_scale);
+        vertex_color(shading, kind, s, value01, color01)
     };
 
     for iz in 0..n {
@@ -1430,10 +1793,11 @@ fn build_iso_value_lines(
     domain: Domain,
     y_range: Range,
     value_range: Option<Range>,
+    color_range: Option<Range>,
     kind: SurfaceKind,
     y_scale: YScale,
     iso_line_count: usize,
-) -> Vec<(Vec3, Vec3)> {
+) -> Vec<IsoSegment> {
     let Some(value_range) = value_range else {
         return Vec::new();
     };
@@ -1443,8 +1807,13 @@ fn build_iso_value_lines(
     }
 
     let n = samples_per_axis;
-    let mut segments = Vec::<(Vec3, Vec3)>::new();
+    let mut segments = Vec::<IsoSegment>::new();
     let eps = (value_range.len().abs() * 1e-12).max(1e-12);
+    let segment = |p: (Vec3, f32), q: (Vec3, f32)| IsoSegment {
+        a: p.0,
+        b: q.0,
+        color01: 0.5 * (p.1 + q.1),
+    };
 
     for iso_index in 1..=iso_line_count {
         let iso_value =
@@ -1502,16 +1871,21 @@ fn build_iso_value_lines(
                 let pc = lift_iso_point(pc);
                 let pd = lift_iso_point(pd);
 
-                let mut points = Vec::<Vec3>::with_capacity(4);
-                push_iso_intersection(&mut points, pa, va, pb, vb, iso_value, eps);
-                push_iso_intersection(&mut points, pb, vb, pc, vc, iso_value, eps);
-                push_iso_intersection(&mut points, pc, vc, pd, vd, iso_value, eps);
-                push_iso_intersection(&mut points, pd, vd, pa, va, iso_value, eps);
+                let ca = sample_color01(kind, sa, color_range, y_scale);
+                let cb = sample_color01(kind, sb, color_range, y_scale);
+                let cc = sample_color01(kind, sc, color_range, y_scale);
+                let cd = sample_color01(kind, sd, color_range, y_scale);
+
+                let mut points = Vec::<(Vec3, f32)>::with_capacity(4);
+                push_iso_intersection(&mut points, (pa, ca), va, (pb, cb), vb, iso_value, eps);
+                push_iso_intersection(&mut points, (pb, cb), vb, (pc, cc), vc, iso_value, eps);
+                push_iso_intersection(&mut points, (pc, cc), vc, (pd, cd), vd, iso_value, eps);
+                push_iso_intersection(&mut points, (pd, cd), vd, (pa, ca), va, iso_value, eps);
 
                 match points.len() {
                     0 | 1 => {}
-                    2 => segments.push((points[0], points[1])),
-                    3 => segments.push((points[0], points[1])),
+                    2 => segments.push(segment(points[0], points[1])),
+                    3 => segments.push(segment(points[0], points[1])),
                     _ => {
                         // Ambiguous marching-squares saddle case. Use a center-value
                         // decider so the contour connectivity is stable across cells.
@@ -1519,11 +1893,11 @@ fn build_iso_value_lines(
                         let a_high = va >= iso_value;
                         let center_high = center >= iso_value;
                         if center_high == a_high {
-                            segments.push((points[0], points[1]));
-                            segments.push((points[2], points[3]));
+                            segments.push(segment(points[0], points[1]));
+                            segments.push(segment(points[2], points[3]));
                         } else {
-                            segments.push((points[0], points[3]));
-                            segments.push((points[1], points[2]));
+                            segments.push(segment(points[0], points[3]));
+                            segments.push(segment(points[1], points[2]));
                         }
                     }
                 }
@@ -1535,27 +1909,23 @@ fn build_iso_value_lines(
 }
 
 fn push_iso_intersection(
-    points: &mut Vec<Vec3>,
-    p0: Vec3,
+    points: &mut Vec<(Vec3, f32)>,
+    p0: (Vec3, f32),
     v0: f64,
-    p1: Vec3,
+    p1: (Vec3, f32),
     v1: f64,
     iso_value: f64,
     eps: f64,
 ) {
-    if let Some(point) = iso_intersection(p0, v0, p1, v1, iso_value, eps) {
-        push_unique_iso_point(points, point);
+    if let Some(t) = iso_crossing(v0, v1, iso_value, eps) {
+        let point = p0.0 + (p1.0 - p0.0) * t;
+        let color01 = p0.1 + (p1.1 - p0.1) * t;
+        push_unique_iso_point(points, (point, color01));
     }
 }
 
-fn iso_intersection(
-    p0: Vec3,
-    v0: f64,
-    p1: Vec3,
-    v1: f64,
-    iso_value: f64,
-    eps: f64,
-) -> Option<Vec3> {
+/// Where along the edge `v0 -> v1` (0 = start, 1 = end) the contour `iso_value` crosses.
+fn iso_crossing(v0: f64, v1: f64, iso_value: f64, eps: f64) -> Option<f32> {
     let d0 = v0 - iso_value;
     let d1 = v1 - iso_value;
 
@@ -1563,22 +1933,21 @@ fn iso_intersection(
         return None;
     }
     if d0.abs() <= eps {
-        return Some(p0);
+        return Some(0.0);
     }
     if d1.abs() <= eps {
-        return Some(p1);
+        return Some(1.0);
     }
     if (d0 > 0.0 && d1 < 0.0) || (d0 < 0.0 && d1 > 0.0) {
-        let t = (-d0 / (d1 - d0)) as f32;
-        Some(p0 + (p1 - p0) * t)
+        Some((-d0 / (d1 - d0)) as f32)
     } else {
         None
     }
 }
 
-fn push_unique_iso_point(points: &mut Vec<Vec3>, point: Vec3) {
+fn push_unique_iso_point(points: &mut Vec<(Vec3, f32)>, point: (Vec3, f32)) {
     const EPS2: f32 = 1e-10;
-    if !points.iter().any(|p| (*p - point).length_squared() <= EPS2) {
+    if !points.iter().any(|(p, _)| (*p - point.0).length_squared() <= EPS2) {
         points.push(point);
     }
 }
@@ -1588,10 +1957,34 @@ fn lift_iso_point(mut point: Vec3) -> Vec3 {
     point
 }
 
-fn draw_iso_line_segments(segments: &[(Vec3, Vec3)], kind: SurfaceKind, transparent: bool) {
-    let color = kind.iso_color(transparent);
-    for (a, b) in segments {
-        draw_line_3d(*a, *b, color);
+fn draw_iso_line_segments(
+    segments: &[IsoSegment],
+    kind: SurfaceKind,
+    shading: Shading,
+    on_filled_surface: bool,
+) {
+    let alpha = if shading.transparent { 0.88 } else { 1.0 };
+    if shading.mode == ColorMode::FourD {
+        if on_filled_surface {
+            // Neutral dark lines read well on the color-mapped surface.
+            let color = Color::new(0.12, 0.12, 0.12, alpha);
+            for seg in segments {
+                draw_line_3d(seg.a, seg.b, color);
+            }
+        } else {
+            // Nothing underneath (wireframe mode): the contours themselves carry the
+            // paired component's color so the 4th dimension stays visible.
+            for seg in segments {
+                let (r, g, b) = shading.colormap.color(seg.color01 + shading.hue_offset);
+                draw_line_3d(seg.a, seg.b, Color::new(r, g, b, alpha));
+            }
+        }
+        return;
+    }
+
+    let color = kind.iso_color(shading.transparent);
+    for seg in segments {
+        draw_line_3d(seg.a, seg.b, color);
     }
 }
 
@@ -1871,9 +2264,23 @@ fn draw_hud(state: &AppState) {
         ColorMode::Phase => "hue: arg(f(x)) rainbow (-pi..pi)   brightness: Re > Im > |f| > arg",
         ColorMode::Height => "rainbow by height, per surface range (blue: low, red: high)",
         ColorMode::Rings => "hue: arg(f(x))   brightness rings: one ring per doubling of |f|",
+        ColorMode::FourD => {
+            "4d: height = surface value, color = its paired component (Re<->Im, |f|<->arg) mapped over that component's min..max:"
+        }
     };
     draw_text(legend, 14.0, y, font_size, BLACK);
     y += line;
+
+    if state.color_mode == ColorMode::FourD {
+        if let Some(plot) = &state.plot {
+            for kind in SurfaceKind::ALL {
+                if !state.is_visible(kind) {
+                    continue;
+                }
+                y = draw_color_bar_line(plot, kind, state.y_scale, state.shading(), y, font_size, line);
+            }
+        }
+    }
 
     if !state.status.is_empty() {
         draw_text(&state.status, 14.0, y, font_size, DARKGRAY);
@@ -1888,10 +2295,10 @@ fn draw_hud(state: &AppState) {
             "Z expand domain by 1.1, X shrink domain by 1.1",
             "H/L move real domain -/+ 10%, J/K move imag domain -/+ 10%",
             "N decrease samples by 10%, M increase samples by 10%",
-            "1/2/3/4 toggle Re(f)/Im(f)/|f|/arg(f) visibility",
+            "1/2/3/4 toggle Re(f)/Im(f)/|f|/arg(f) visibility, 5 swap Re<->Im and |f|<->arg",
             "T toggle transparency, F toggle filled vs wireframe",
-            "C cycle color mode: solid / phase / height / rings",
-            "B toggle rainbow hue animation (phase/height/rings modes)",
+            "C cycle color mode: solid / phase / height / rings / 4d",
+            "B toggle rainbow hue animation (phase/height/rings/4d modes)",
             "V cycle derivative: f / f' / f'' (numeric, on the fly)",
             "G cycle vertical scale: linear / arsinh / log10",
             "I toggle iso-value lines, U/O decrease/increase iso-line count",
@@ -1909,6 +2316,60 @@ fn unix_timestamp_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// One HUD line of the `4d` color mode: "<surface> colored by <partner>: min [bar] max",
+/// with true (un-transformed) range labels. Returns the y position of the next line.
+fn draw_color_bar_line(
+    plot: &PlotData,
+    kind: SurfaceKind,
+    y_scale: YScale,
+    shading: Shading,
+    y: f32,
+    font_size: f32,
+    line: f32,
+) -> f32 {
+    let partner = kind.partner();
+    let prefix = format!("{} colored by {}:", kind.label(), partner.label());
+    draw_text(&prefix, 14.0, y, font_size, BLACK);
+    let mut x = 14.0 + measure_text(&prefix, None, font_size as u16, 1.0).width + 10.0;
+
+    match plot.surface(partner).value_range {
+        Some(range) => {
+            let min_label = fmt_axis(y_scale.invert(range.min));
+            draw_text(&min_label, x, y, font_size, BLACK);
+            x += measure_text(&min_label, None, font_size as u16, 1.0).width + 8.0;
+
+            let bar_width = 300.0;
+            let bar_height = line - 6.0;
+            let bar_top = y - bar_height + 3.0;
+            draw_colormap_bar(shading.colormap, shading.hue_offset, x, bar_top, bar_width, bar_height);
+            x += bar_width + 8.0;
+
+            let max_label = fmt_axis(y_scale.invert(range.max));
+            draw_text(&max_label, x, y, font_size, BLACK);
+            x += measure_text(&max_label, None, font_size as u16, 1.0).width + 12.0;
+            if y_scale != YScale::Linear {
+                draw_text(&format!("[{} scale]", y_scale.label()), x, y, font_size, DARKGRAY);
+            }
+        }
+        None => {
+            draw_text("constant (no color range)", x, y, font_size, DARKGRAY);
+        }
+    }
+    y + line
+}
+
+fn draw_colormap_bar(colormap: &ColorMap, hue_offset: f32, x: f32, y: f32, width: f32, height: f32) {
+    let steps = 120;
+    let step_width = width / steps as f32;
+    for i in 0..steps {
+        let t = (i as f32 + 0.5) / steps as f32;
+        let (r, g, b) = colormap.color(t + hue_offset);
+        // Slight overlap hides seams between the strips.
+        draw_rectangle(x + i as f32 * step_width, y, step_width + 0.75, height, Color::new(r, g, b, 1.0));
+    }
+    draw_rectangle_lines(x, y, width, height, 1.5, Color::new(0.1, 0.1, 0.1, 1.0));
 }
 
 fn fmt_axis(value: f64) -> String {
@@ -2803,12 +3264,294 @@ mod tests {
     }
 
     #[test]
+    fn default_colormap_hits_stops_and_wraps_seamlessly() {
+        let close = |a: (f32, f32, f32), b: (f32, f32, f32), tol: f32| {
+            (a.0 - b.0).abs() <= tol && (a.1 - b.1).abs() <= tol && (a.2 - b.2).abs() <= tol
+        };
+        let map = ColorMap::default();
+        let segments = (map.stops.len() - 1) as f32;
+        // Every stop is reproduced exactly at its position, including the last at t = 1.
+        for (i, stop) in map.stops.iter().enumerate() {
+            let t = i as f32 / segments;
+            assert!(close(map.color(t), *stop, 1e-5), "stop {i} mismatch");
+        }
+        // Gray ends, black just above the minimum, white just below the maximum.
+        assert!(close(map.color(0.0), (0.5, 0.5, 0.5), 1e-6));
+        assert!(close(map.color(1.0), (0.5, 0.5, 0.5), 1e-6));
+        assert!(close(map.color(1.0 / segments), (0.0, 0.0, 0.0), 1e-5));
+        assert!(close(map.color(11.0 / segments), (1.0, 1.0, 1.0), 1e-5));
+        // Cyclic and continuous across the wrap; in range everywhere.
+        assert!(close(map.color(0.999), map.color(-0.001), 1e-4));
+        assert!(close(map.color(0.37), map.color(1.37), 1e-4));
+        for i in 0..=1000 {
+            let (r, g, b) = map.color(i as f32 / 1000.0);
+            for c in [r, g, b] {
+                assert!((0.0..=1.0).contains(&c), "component {c} out of range at {i}");
+            }
+        }
+        // Non-finite input does not panic and yields a valid color.
+        let (r, g, b) = map.color(f32::NAN);
+        assert!(r.is_finite() && g.is_finite() && b.is_finite());
+    }
+
+    #[test]
+    fn colormap_spec_parses_and_roundtrips() {
+        // The default map survives a spec round trip (this is what `--help` prints).
+        let default = ColorMap::default();
+        assert_eq!(ColorMap::parse(&default.to_spec()).unwrap(), default);
+
+        // Lenient separators: missing comma between stops, whitespace, newlines.
+        let spec = "12,(.5,.5,.5),(0,0,0),(0,.5,1),(0,0,1),(0,1,1),(0,1,0),\n(1,1,0), (1,.5,0) (1,0,0),(1,0,.5),(1,1,1)(.5,.5,.5)";
+        let map = ColorMap::parse(spec).unwrap();
+        assert_eq!(map.stops.len(), 12);
+        assert_eq!(map.stops[0], (0.5, 0.5, 0.5));
+        assert_eq!(map.stops[2], (0.0, 0.5, 1.0));
+        assert_eq!(map.stops[11], (0.5, 0.5, 0.5));
+        // Stops are evenly spaced: stop k sits at t = k / (N - 1).
+        let (r, g, b) = map.color(2.0 / 11.0);
+        assert!(r.abs() < 1e-5 && (g - 0.5).abs() < 1e-5 && (b - 1.0).abs() < 1e-5);
+        // Midway between black and (0,.5,1).
+        let (r, g, b) = map.color(1.5 / 11.0);
+        assert!(r.abs() < 1e-5 && (g - 0.25).abs() < 1e-5 && (b - 0.5).abs() < 1e-5);
+
+        // Two stops is the minimum: a plain gradient from the first to the last stop.
+        let map = ColorMap::parse("2,(0,0,0),(1,1,1)").unwrap();
+        assert_eq!(map.color(0.5), (0.5, 0.5, 0.5));
+        assert_eq!(map.color(0.0), (0.0, 0.0, 0.0));
+        // The maximum of the colored component (color01 == 1 exactly) is the LAST stop,
+        // not a wrap-around to the first one; only out-of-range values wrap.
+        assert_eq!(map.color(1.0), (1.0, 1.0, 1.0));
+        let ramp = ColorMap::parse("3,(0,0,0),(1,0,0),(1,1,1)").unwrap();
+        assert_eq!(ramp.color(1.0), (1.0, 1.0, 1.0));
+        assert_eq!(ramp.color(0.5), (1.0, 0.0, 0.0));
+        assert_eq!(ramp.color(1.5), (1.0, 0.0, 0.0));
+        assert_eq!(ramp.color(-0.5), (1.0, 0.0, 0.0));
+        assert_eq!(ramp.color(2.0), (0.0, 0.0, 0.0));
+
+        // Errors: count mismatch, too few stops, bad numbers, out-of-range, garbage.
+        assert!(ColorMap::parse("3,(0,0,0),(1,1,1)").is_err());
+        assert!(ColorMap::parse("2,(0,0,0),(1,1,1),(0,0,0)").is_err());
+        assert!(ColorMap::parse("1,(0,0,0)").is_err());
+        assert!(ColorMap::parse("2,(0,0),(1,1,1)").is_err());
+        assert!(ColorMap::parse("2,(0,0,x),(1,1,1)").is_err());
+        assert!(ColorMap::parse("2,(0,0,2),(1,1,1)").is_err());
+        assert!(ColorMap::parse("2,(0,0,-0.1),(1,1,1)").is_err());
+        assert!(ColorMap::parse("2,(0,0,0),(1,1,1").is_err());
+        assert!(ColorMap::parse("(0,0,0),(1,1,1)").is_err());
+        assert!(ColorMap::parse("").is_err());
+        assert!(ColorMap::parse("two,(0,0,0),(1,1,1)").is_err());
+        // Absurd counts are plain errors, never allocation failures.
+        assert!(ColorMap::parse("18446744073709551615,(0,0,0),(1,1,1)").is_err());
+        assert!(ColorMap::parse("100000000000,(0,0,0),(1,1,1)").is_err());
+        assert!(ColorMap::parse("99999999999999999999999,(0,0,0),(1,1,1)").is_err());
+
+        // `@FILE` loads the spec from a file.
+        let path = std::env::temp_dir().join(format!(
+            "complex_surface_viewer_colormap_{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&path, "3,\n(0,0,0),\n(1,0,0),\n(1,1,1)\n").unwrap();
+        let arg = format!("@{}", path.display());
+        let loaded = ColorMap::from_cli_arg(&arg).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(loaded.stops, vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 1.0)]);
+        assert!(ColorMap::from_cli_arg("@/nonexistent/colormap.txt").is_err());
+    }
+
+    #[test]
+    fn surface_partners_pair_cartesian_and_polar_components() {
+        assert_eq!(SurfaceKind::Real.partner(), SurfaceKind::Imag);
+        assert_eq!(SurfaceKind::Imag.partner(), SurfaceKind::Real);
+        assert_eq!(SurfaceKind::Abs.partner(), SurfaceKind::Arg);
+        assert_eq!(SurfaceKind::Arg.partner(), SurfaceKind::Abs);
+        for kind in SurfaceKind::ALL {
+            assert_eq!(kind.partner().partner(), kind);
+        }
+    }
+
+    #[test]
+    fn color_mode_cycle_visits_every_mode_once() {
+        let mut seen = vec![ColorMode::Solid];
+        let mut mode = ColorMode::Solid.next();
+        while mode != ColorMode::Solid {
+            assert!(!seen.contains(&mode));
+            seen.push(mode);
+            mode = mode.next();
+        }
+        assert_eq!(seen.len(), 5);
+        assert!(seen.contains(&ColorMode::FourD));
+        assert!(ColorMode::FourD.uses_hue());
+        assert_eq!(ColorMode::from_cli_name("4d"), Some(ColorMode::FourD));
+        assert_eq!(ColorMode::from_cli_name("RINGS"), Some(ColorMode::Rings));
+        assert_eq!(ColorMode::from_cli_name("nope"), None);
+    }
+
+    fn shading(mode: ColorMode, transparent: bool, colormap: &ColorMap) -> Shading<'_> {
+        Shading {
+            mode,
+            hue_offset: 0.0,
+            transparent,
+            colormap,
+        }
+    }
+
+    #[test]
+    fn four_d_mode_colors_surface_by_partner_component() {
+        // f(x) = x: Re surface height is re(x), its color must follow im(x).
+        let expr = Parser::parse("x").unwrap();
+        let domain = Domain {
+            re: Range::new(-1.0, 1.0).unwrap(),
+            im: Range::new(-3.0, 5.0).unwrap(),
+        };
+        let visibility = SurfaceVisibility::from_cli_list("re").unwrap();
+        let colormap = ColorMap::parse("3,(0,0,0),(1,0,0),(1,1,1)").unwrap();
+        let n = 9;
+        let plot = build_plot(
+            &expr,
+            domain,
+            n,
+            visibility,
+            shading(ColorMode::FourD, false, &colormap),
+            false,
+            0,
+            0,
+            YScale::Linear,
+        );
+
+        // Only the requested surface is built, but every range is known.
+        assert!(!plot.surface(SurfaceKind::Real).meshes.is_empty());
+        assert!(plot.surface(SurfaceKind::Imag).meshes.is_empty());
+        let im_range = plot.surface(SurfaceKind::Imag).value_range.unwrap();
+        assert!((im_range.min - -3.0).abs() < 1e-12 && (im_range.max - 5.0).abs() < 1e-12);
+
+        let surface = plot.surface(SurfaceKind::Real);
+        let mesh = &surface.meshes[0];
+        let infos = &surface.vertex_infos[0];
+        assert_eq!(mesh.vertices.len(), infos.len());
+        assert_eq!(mesh.vertices.len(), n * n);
+        for (row, chunk) in infos.chunks(n).enumerate() {
+            // Rows share im(x), so color01 is constant along a row and grows with it.
+            let expected = row as f32 / (n - 1) as f32;
+            for info in chunk {
+                assert!((info.color01 - expected).abs() < 1e-5, "row {row}: {}", info.color01);
+            }
+        }
+        // Vertex colors come from the custom map applied to color01 (opaque).
+        for (vertex, info) in mesh.vertices.iter().zip(infos.iter()) {
+            let (r, g, b) = colormap.color(info.color01);
+            let expected: [u8; 4] = Color::new(r, g, b, 1.0).into();
+            assert_eq!(vertex.color, expected);
+        }
+        // The vertex color of the `4d` mode depends only on the partner component.
+        let s = plot.samples[0];
+        let a = vertex_color(shading(ColorMode::FourD, false, &colormap), SurfaceKind::Real, s, 0.1, 0.25);
+        let b = vertex_color(shading(ColorMode::FourD, false, &colormap), SurfaceKind::Abs, s, 0.9, 0.25);
+        assert_eq!(a.r, b.r);
+        assert_eq!(a.g, b.g);
+        assert_eq!(a.b, b.b);
+        // color01 = 0.25 is halfway between black and red in this map.
+        assert!((a.r - 0.5).abs() < 1e-6 && a.g.abs() < 1e-6 && a.b.abs() < 1e-6);
+        // Transparency applies to the new mode as well.
+        let t = vertex_color(shading(ColorMode::FourD, true, &colormap), SurfaceKind::Real, s, 0.1, 0.25);
+        assert!((t.a - TRANSPARENT_ALPHA).abs() < 1e-6);
+    }
+
+    #[test]
+    fn existing_color_modes_ignore_color01_and_colormap() {
+        let s = Sample {
+            real: 0.3,
+            imag: -0.8,
+            abs: 0.85,
+            arg: -1.2,
+            valid: true,
+        };
+        let default_map = ColorMap::default();
+        let other_map = ColorMap::parse("2,(0,0,0),(1,1,1)").unwrap();
+        for mode in [ColorMode::Solid, ColorMode::Phase, ColorMode::Height, ColorMode::Rings] {
+            let a = vertex_color(shading(mode, false, &default_map), SurfaceKind::Imag, s, 0.4, 0.0);
+            let b = vertex_color(shading(mode, false, &other_map), SurfaceKind::Imag, s, 0.4, 1.0);
+            assert_eq!((a.r, a.g, a.b, a.a), (b.r, b.g, b.b, b.a), "{}", mode.label());
+        }
+        // Solid mode still yields the fixed per-surface colors.
+        let solid = vertex_color(shading(ColorMode::Solid, false, &default_map), SurfaceKind::Real, s, 0.4, 0.0);
+        let expected = SurfaceKind::Real.color(false);
+        assert_eq!((solid.r, solid.g, solid.b, solid.a), (expected.r, expected.g, expected.b, expected.a));
+    }
+
+    #[test]
+    fn parses_cli_options() {
+        let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        let cli = parse_cli(&args(&["x^2"])).unwrap();
+        assert_eq!(cli.function, "x^2");
+        assert_eq!(cli.color_mode, ColorMode::Solid);
+        assert_eq!(cli.visibility, SurfaceVisibility::default());
+        assert_eq!(cli.colormap, ColorMap::default());
+        assert!(cli.screenshot.is_none());
+        assert_eq!((cli.re.min, cli.re.max, cli.im.min, cli.im.max), (-2.0, 2.0, -2.0, 2.0));
+
+        let cli = parse_cli(&args(&[
+            "--color=4d",
+            "--show=im,arg",
+            "--colormap=3,(0,0,0),(1,0,0),(1,1,1)",
+            "--screenshot=out.png",
+            "-x",
+            "-1",
+            "1.5",
+            "-2",
+            "3",
+        ]))
+        .unwrap();
+        assert_eq!(cli.function, "-x");
+        assert_eq!(cli.color_mode, ColorMode::FourD);
+        assert_eq!(
+            cli.visibility,
+            SurfaceVisibility {
+                show_real: false,
+                show_imag: true,
+                show_abs: false,
+                show_arg: true,
+            }
+        );
+        assert_eq!(cli.colormap.stops, vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 1.0)]);
+        assert_eq!(cli.screenshot.as_deref(), Some("out.png"));
+        assert_eq!((cli.re.min, cli.re.max, cli.im.min, cli.im.max), (-1.0, 1.5, -2.0, 3.0));
+
+        assert!(parse_cli(&args(&["x", "1"])).is_err());
+        assert!(parse_cli(&args(&["x", "1", "0", "-1", "1"])).is_err());
+        assert!(parse_cli(&args(&["x", "a", "1", "-1", "1"])).is_err());
+        assert!(parse_cli(&args(&["--color=neon", "x"])).is_err());
+        assert!(parse_cli(&args(&["--show=re,foo", "x"])).is_err());
+        assert!(parse_cli(&args(&["--colormap=2,(0,0,0)", "x"])).is_err());
+        assert!(parse_cli(&args(&["--screenshot=", "x"])).is_err());
+        assert!(parse_cli(&args(&["--bogus", "x"])).is_err());
+        assert!(parse_cli(&args(&["--x"])).is_err());
+        // "--" ends option parsing so double-negated expressions still work.
+        let cli = parse_cli(&args(&["--color=4d", "--", "--x"])).unwrap();
+        assert_eq!(cli.function, "--x");
+        assert_eq!(cli.color_mode, ColorMode::FourD);
+    }
+
+    #[test]
     fn iso_intersection_finds_crossings() {
         let p0 = vec3(0.0, 0.0, 0.0);
         let p1 = vec3(1.0, 0.0, 0.0);
-        let hit = iso_intersection(p0, 0.0, p1, 1.0, 0.5, 1e-12).unwrap();
+        let t = iso_crossing(0.0, 1.0, 0.5, 1e-12).unwrap();
+        let hit = p0 + (p1 - p0) * t;
         assert!((hit.x - 0.5).abs() < 1e-6);
-        assert!(iso_intersection(p0, 0.0, p1, 1.0, 2.0, 1e-12).is_none());
+        assert_eq!(iso_crossing(0.0, 1.0, 0.0, 1e-12), Some(0.0));
+        assert_eq!(iso_crossing(0.0, 1.0, 1.0, 1e-12), Some(1.0));
+        assert!(iso_crossing(0.0, 1.0, 2.0, 1e-12).is_none());
+        assert!(iso_crossing(0.5, 0.5, 0.5, 1e-12).is_none());
+
+        // Interpolated attributes follow the same parameter as the position.
+        let mut points = Vec::new();
+        push_iso_intersection(&mut points, (p0, 0.0), 0.0, (p1, 1.0), 4.0, 1.0, 1e-12);
+        assert_eq!(points.len(), 1);
+        assert!((points[0].0.x - 0.25).abs() < 1e-6 && (points[0].1 - 0.25).abs() < 1e-6);
+        // Duplicate positions are not pushed twice.
+        push_iso_intersection(&mut points, (p0, 0.0), 0.0, (p1, 1.0), 4.0, 1.0, 1e-12);
+        assert_eq!(points.len(), 1);
     }
 
     #[test]
@@ -2825,18 +3568,17 @@ mod tests {
             show_arg: true,
         };
         // Odd sample count puts a sample exactly on the pole at 0.
+        let colormap = ColorMap::default();
         let plot = build_plot(
             &expr,
             domain,
             21,
             visibility,
-            false,
+            shading(ColorMode::Rings, false, &colormap),
             true,
             4,
             0,
             YScale::Arsinh,
-            ColorMode::Rings,
-            0.0,
         );
         assert_eq!(plot.total_sample_count, 441);
         assert!(plot.finite_sample_count < plot.total_sample_count);
@@ -2849,6 +3591,50 @@ mod tests {
             for (mesh, infos) in surface.meshes.iter().zip(surface.vertex_infos.iter()) {
                 assert_eq!(mesh.vertices.len(), infos.len());
             }
+            assert!(!surface.iso_lines.is_empty());
+            for seg in &surface.iso_lines {
+                assert!(seg.a.is_finite() && seg.b.is_finite());
+                assert!((0.0..=1.0).contains(&seg.color01), "{seg:?}");
+            }
         }
+    }
+
+    #[test]
+    fn iso_segments_carry_partner_color() {
+        // f(x) = x on a 9x9 grid: Re contours are lines re(x) = c crossing whole cells
+        // between two sample rows, so each segment's color01 (from im(x)) must be the
+        // midpoint of two neighbouring row values.
+        let expr = Parser::parse("x").unwrap();
+        let domain = Domain {
+            re: Range::new(-1.0, 1.0).unwrap(),
+            im: Range::new(-3.0, 5.0).unwrap(),
+        };
+        let visibility = SurfaceVisibility::from_cli_list("re").unwrap();
+        let colormap = ColorMap::default();
+        let n = 9;
+        let plot = build_plot(
+            &expr,
+            domain,
+            n,
+            visibility,
+            shading(ColorMode::FourD, false, &colormap),
+            true,
+            4,
+            0,
+            YScale::Linear,
+        );
+        let segments = &plot.surface(SurfaceKind::Real).iso_lines;
+        // 4 contours, each crossing the 8 cell rows once.
+        assert_eq!(segments.len(), 4 * (n - 1));
+        let mut rows_seen = vec![0usize; n - 1];
+        for seg in segments {
+            let row = seg.color01 * (n - 1) as f32 - 0.5;
+            assert!((row - row.round()).abs() < 1e-4, "{seg:?}");
+            rows_seen[row.round() as usize] += 1;
+        }
+        assert!(rows_seen.iter().all(|&count| count == 4), "{rows_seen:?}");
+        // Surfaces that are hidden get no contours, but keep their range.
+        assert!(plot.surface(SurfaceKind::Imag).iso_lines.is_empty());
+        assert!(plot.surface(SurfaceKind::Imag).value_range.is_some());
     }
 }
