@@ -30,12 +30,15 @@ Options (all optional, may appear anywhere among the positional arguments):
 | `--show=LIST`       | initially visible surfaces, comma-separated subset of `re,im,abs,arg` (default `re,im,abs`)              |
 | `--colormap=SPEC`   | color map used by the `4d` mode, see [Color map](#color-map); `@FILE` reads the spec from a file          |
 | `--screenshot=FILE` | render one frame, save it as PNG to `FILE` and exit (handy for scripting / headless checks under Xvfb)   |
+| `--csv=FILE`        | save the grid values as CSV to `FILE` plus the im=0 / re=0 lines to `FILE_im0` / `FILE_re0` and exit, see [CSV export](#csv-export) |
+| `--iter=T`          | plot the `T`-th iterate `f^T` for a complex `T` (`2`, `0.5`, `i`, `-.125-.02i`), see [Fractional iteration](#fractional-iteration) |
 | `-h`, `--help`      | print usage, including the default color map spec                                                        |
 | `--`                | end of options; only needed for an expression that itself starts with `--`, e.g. `-- "--x"`              |
 
 ```bash
 cargo run --release -- --color=4d --show=re "x^2"
 cargo run --release -- --color=4d --show=abs --colormap="3,(0,0,0),(1,0,0),(1,1,1)" "1/x"
+cargo run --release -- --iter=0.5 --color=4d --show=re "exp(x)"
 ```
 
 ## Controls
@@ -66,6 +69,7 @@ cargo run --release -- --color=4d --show=abs --colormap="3,(0,0,0),(1,0,0),(1,1,
 - `I`: toggle iso-value lines
 - `U/O`: decrease/increase iso-value line count
 - `P`: save the current view as PNG
+- `Y`: save the grid values as CSV, see [CSV export](#csv-export)
 - `F1`: hide/show help overlay
 - `F11`: toggle fullscreen
 - `Esc`: quit
@@ -182,6 +186,25 @@ Example: a simple black -> red -> white ramp
 cargo run --release -- --color=4d --show=abs --colormap="3,(0,0,0),(1,0,0),(1,1,1)" "1/x"
 ```
 
+## CSV export
+
+`Y` (or `--csv=FILE`) writes three comma-separated files with a header row,
+ready for Google Sheets / LibreOffice charts (first column as X axis, the
+others as series):
+
+- `complex_values_<timestamp>.csv` — exactly the displayed grid, one row per
+  sample in grid order: `arg-re,arg-im,val-re,val-im,val-abs,val-arg`
+- `..._im0.csv` — values along the real axis (`im = 0`): `arg-re,val-re,val-im,val-abs,val-arg`
+- `..._re0.csv` — values along the imaginary axis (`re = 0`): `arg-im,val-re,val-im,val-abs,val-arg`
+
+The axis lines are computed when saving at the grid's sample count over the
+current `re` / `im` range with the same derivative order and `--iter` setting,
+so they are exact even when the grid does not land on `im = 0` / `re = 0`
+(and identical to the grid rows when it does). Values are the raw function
+values (the `G` vertical scale does not apply); `val-arg` is in radians, and
+poles / invalid samples leave the value cells empty. Numbers use `.` as the
+decimal separator - pick an English locale in the import dialog if yours uses `,`.
+
 ## Derivative view
 
 `V` cycles between plotting `f`, `f'` and `f''`. Derivatives are computed
@@ -238,6 +261,38 @@ cargo run --release -- "gamma(x)" -4.5 4.5 -2.5 2.5
 
 with the `rings` color mode and `arsinh` vertical scale.
 
+## Fractional iteration
+
+`--iter=T` plots `f^T`, the `T`-th iterate of `f`, for any complex constant `T`
+(same syntax as constants in expressions: `2`, `0.5`, `i`, `-.125-.02i`).
+Without `--iter` (or with `--iter=1`) the program behaves exactly as before.
+
+- `T=0` is the identity, positive integers compose `f` directly (`--iter=2` is `f(f(x))`).
+- Any other `T` uses numerical *regular iteration*: `f^T = Φ(λ^T Φ⁻¹(x))` where
+  `Φ` is the Schröder/Koenigs conjugacy `Φ(λu) = f(Φ(u))` at a hyperbolic fixed
+  point `p = f(p)`, `λ = f'(p)`, `0 < |λ| ≠ 1`. `Φ` comes from a Taylor series at
+  `p` (Cauchy-integral coefficients) extended by iterating `f`; its inverse is
+  followed by Newton continuation along the straight segment from `p` to `x`.
+  `λ^T` uses the principal branch. The fixed point is searched once at startup
+  near the initial domain (repelling points are preferred, then the one nearest
+  to the domain center) and kept while you pan/zoom, so all samples use one
+  consistent branch. The HUD shows `p`, `λ` and the series radii.
+- `f^T` is single-valued only up to that branch choice: expect cuts, holes
+  (points that cannot be reached by the continuation, e.g. `f^0.5(exp)` at
+  `0` and `1`, the asymptotic values of `Φ`) and tall spikes along them; `G`
+  (arsinh/log10 scale) helps. If `f` has no hyperbolic fixed point near the
+  domain (`x+1` has none) the program prints an error and exits with status 2 -
+  move the domain or change `f`.
+- Cost: grids are built in parallel threads; a 191x191 grid of `exp` takes well
+  under a second, resampling happens on every domain change (`Z`/`X`/`H`/`J`/`K`/`L`/`N`/`M`).
+
+```bash
+cargo run --release -- --iter=0.5 --color=4d --show=re "exp(x)"   # half-iterate of exp
+cargo run --release -- --iter=i "exp(x)"                           # imaginary-order iterate
+cargo run --release -- --iter=2 "x^2"                              # x^4, direct composition
+cargo run --release -- --iter=0.5 "2x/(1+x)"                        # matches the closed form
+```
+
 ## Tests
 
 ```bash
@@ -246,7 +301,8 @@ cargo test
 
 covers the expression parser/evaluator, gamma, numeric derivatives,
 vertical-scale transforms, plot building around poles, the `4d` coloring and
-its color-map parser, and the command-line options.
+its color-map parser, the command-line options, fractional iteration
+(closed forms for affine/Möbius/`x^2`, `f^0.5∘f^0.5 = exp`) and the CSV export.
 
 ## FreeBSD support
 

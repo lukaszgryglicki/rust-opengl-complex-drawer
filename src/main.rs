@@ -226,9 +226,33 @@ fn main() {
     println!("Real domain: [{}, {}]", cli.re.min, cli.re.max);
     println!("Imag domain: [{}, {}]", cli.im.min, cli.im.max);
     println!("Samples: {} x {}", DEFAULT_SAMPLES_PER_AXIS, DEFAULT_SAMPLES_PER_AXIS);
+
+    let iterate = match cli.iter {
+        Some(t) => {
+            let started = std::time::Instant::now();
+            let domain = Domain {
+                re: cli.re,
+                im: cli.im,
+            };
+            let iterate = Iterate::for_count(&expr, t, domain).unwrap_or_else(|err| {
+                eprintln!("--iter={}: {err}", fmt_complex(t));
+                std::process::exit(2);
+            });
+            match &iterate {
+                Some(iterate) => println!(
+                    "Iteration: {} (set up in {:.2} s)",
+                    iterate.describe(),
+                    started.elapsed().as_secs_f64()
+                ),
+                None => println!("Iteration: t=1, plotting f itself"),
+            }
+            iterate
+        }
+        None => None,
+    };
     println!("Press F1 in the window for controls.");
 
-    macroquad::Window::from_config(window_conf(), run_viewer(cli, expr));
+    macroquad::Window::from_config(window_conf(), run_viewer(cli, expr, iterate));
 
     // On a working platform `Window::from_config` blocks until the user quits,
     // and at least one frame is always rendered first. If we get here without
@@ -248,12 +272,14 @@ fn main() {
 /// platform-backend failure (see the check at the end of `main`).
 static FRAME_RENDERED: AtomicBool = AtomicBool::new(false);
 
-async fn run_viewer(cli: Cli, expr: Expr) {
+async fn run_viewer(cli: Cli, expr: Expr, iterate: Option<Iterate>) {
     let mut screenshot_path = cli.screenshot.clone();
+    let mut csv_path = cli.csv.clone();
     let mut frame_index: u32 = 0;
     let mut state = AppState {
         function_text: cli.function.clone(),
         expr,
+        iterate,
         domain: Domain {
             re: cli.re,
             im: cli.im,
@@ -520,13 +546,25 @@ async fn run_viewer(cli: Cli, expr: Expr) {
             save_screenshot(&filename);
             state.status = format!("saved {filename}");
         }
+        if is_key_pressed(KeyCode::Y) {
+            let filename = format!("complex_values_{}.csv", unix_timestamp_seconds());
+            state.status = save_csv_files(&state, &filename).unwrap_or_else(|err| {
+                eprintln!("{err}");
+                err
+            });
+        }
 
-        // `--screenshot=FILE`: capture once the window has settled, then quit.
-        if frame_index >= SCREENSHOT_FRAME {
+        // `--screenshot=FILE` / `--csv=FILE`: save once the window has settled, then quit.
+        if frame_index >= SCREENSHOT_FRAME && (screenshot_path.is_some() || csv_path.is_some()) {
             if let Some(path) = screenshot_path.take() {
                 save_screenshot(&path);
-                break;
             }
+            if let Some(path) = csv_path.take() {
+                if let Err(err) = save_csv_files(&state, &path) {
+                    eprintln!("{err}");
+                }
+            }
+            break;
         }
         frame_index = frame_index.saturating_add(1);
 
@@ -537,6 +575,92 @@ async fn run_viewer(cli: Cli, expr: Expr) {
 fn save_screenshot(path: &str) {
     get_screen_data().export_png(path);
     println!("Saved screenshot to {path}");
+}
+
+/// Writes the displayed grid to `grid_path` and the values along the real axis (im = 0)
+/// and the imaginary axis (re = 0), computed now at the grid resolution, to
+/// `<grid_path>_im0.csv` / `<grid_path>_re0.csv`. Returns the status line.
+fn save_csv_files(state: &AppState, grid_path: &str) -> Result<String, String> {
+    let plot = state.plot.as_ref().ok_or("nothing plotted yet")?;
+    let f = Function {
+        expr: &state.expr,
+        iterate: state.iterate.as_ref(),
+    };
+    let im0_path = path_with_suffix(grid_path, "_im0");
+    let re0_path = path_with_suffix(grid_path, "_re0");
+    let files = [
+        (grid_path, grid_csv(plot)),
+        (im0_path.as_str(), axis_csv(f, plot, Axis::Real)),
+        (re0_path.as_str(), axis_csv(f, plot, Axis::Imag)),
+    ];
+    for (path, contents) in &files {
+        std::fs::write(path, contents).map_err(|err| format!("cannot write {path}: {err}"))?;
+        println!("Saved CSV to {path} ({} rows)", contents.lines().count() - 1);
+    }
+    Ok(format!("saved {grid_path}, {im0_path}, {re0_path}"))
+}
+
+const CSV_VALUE_HEADER: &str = "val-re,val-im,val-abs,val-arg";
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Axis {
+    Real,
+    Imag,
+}
+
+/// The displayed grid, one row per sample in grid order (im rows, re within a row).
+fn grid_csv(plot: &PlotData) -> String {
+    let n = plot.samples_per_axis;
+    let steps = n - 1;
+    let mut out = format!("arg-re,arg-im,{CSV_VALUE_HEADER}\n");
+    for (index, sample) in plot.samples.iter().enumerate() {
+        let re = lerp_f64(plot.domain.re.min, plot.domain.re.max, (index % n) as f64 / steps as f64);
+        let im = lerp_f64(plot.domain.im.min, plot.domain.im.max, (index / n) as f64 / steps as f64);
+        csv_row(&mut out, &[re, im], *sample);
+    }
+    out
+}
+
+/// Values of the plotted function along one coordinate axis over the plot's range of
+/// that axis, sampled like the grid (same count, derivative order and step).
+fn axis_csv(f: Function, plot: &PlotData, axis: Axis) -> String {
+    let n = plot.samples_per_axis;
+    let steps = n - 1;
+    let h = deriv_step(plot.domain, plot.deriv_order);
+    let (range, header) = match axis {
+        Axis::Real => (plot.domain.re, "arg-re"),
+        Axis::Imag => (plot.domain.im, "arg-im"),
+    };
+    let mut out = format!("{header},{CSV_VALUE_HEADER}\n");
+    for i in 0..n {
+        let x = lerp_f64(range.min, range.max, i as f64 / steps as f64);
+        let z = match axis {
+            Axis::Real => C::new(x, 0.0),
+            Axis::Imag => C::new(0.0, x),
+        };
+        csv_row(&mut out, &[x], sample_at(f, z, plot.deriv_order, h));
+    }
+    out
+}
+
+/// Argument columns followed by re, im, |f|, arg(f); non-finite values become empty cells.
+fn csv_row(out: &mut String, args: &[f64], sample: Sample) {
+    let fields = args
+        .iter()
+        .chain(&[sample.real, sample.imag, sample.abs, sample.arg])
+        .map(|v| if v.is_finite() { v.to_string() } else { String::new() })
+        .collect::<Vec<_>>();
+    out.push_str(&fields.join(","));
+    out.push('\n');
+}
+
+/// "dir/name.csv" + "_im0" -> "dir/name_im0.csv" (suffix appended when there is no extension).
+fn path_with_suffix(path: &str, suffix: &str) -> String {
+    let name_start = path.rfind(['/', '\\']).map_or(0, |i| i + 1);
+    match path[name_start..].rfind('.') {
+        Some(dot) if dot > 0 => format!("{}{}{}", &path[..name_start + dot], suffix, &path[name_start + dot..]),
+        _ => format!("{path}{suffix}"),
+    }
 }
 
 fn parse_cli_or_exit() -> Cli {
@@ -567,6 +691,11 @@ fn print_usage() {
     eprintln!("                     component; use @FILE to read SPEC from a file. Default:");
     eprintln!("                     \"{}\"", ColorMap::default().to_spec());
     eprintln!("  --screenshot=FILE  render one frame, save it as PNG to FILE and exit");
+    eprintln!("  --csv=FILE         save the grid values as CSV to FILE, the values along the axes");
+    eprintln!("                     im=0 / re=0 to FILE_im0 / FILE_re0 (before the extension), and exit");
+    eprintln!("  --iter=T           plot the T-th iterate of f (complex T, e.g. 2, 0.5, i, -.125-.02i):");
+    eprintln!("                     T=0 identity, positive integers compose f directly, anything else uses");
+    eprintln!("                     numerical regular iteration at a fixed point of f (slow); T=1 is plain f");
     eprintln!("  -h, --help         show this help");
     eprintln!("  --                 end of options (needed only for expressions starting with \"--\")");
     eprintln!();
@@ -576,6 +705,7 @@ fn print_usage() {
     eprintln!("  complex_surface_viewer \"gamma(x)\" -4.5 4.5 -2.5 2.5");
     eprintln!("  complex_surface_viewer --color=4d --show=re \"x^2\"");
     eprintln!("  complex_surface_viewer --color=4d --show=abs --colormap=\"3,(0,0,0),(1,0,0),(1,1,1)\" \"1/x\"");
+    eprintln!("  complex_surface_viewer --iter=0.5 --color=4d --show=re \"exp(x)\"");
 }
 
 fn parse_cli(args: &[String]) -> Result<Cli, String> {
@@ -583,6 +713,8 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
     let mut visibility = SurfaceVisibility::default();
     let mut colormap = ColorMap::default();
     let mut screenshot = None;
+    let mut csv = None;
+    let mut iter = None;
     let mut positional = Vec::<&str>::new();
     let mut options_done = false;
 
@@ -599,11 +731,18 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
             visibility = SurfaceVisibility::from_cli_list(value)?;
         } else if let Some(value) = arg.strip_prefix("--colormap=") {
             colormap = ColorMap::from_cli_arg(value).map_err(|err| format!("Invalid --colormap: {err}"))?;
+        } else if let Some(value) = arg.strip_prefix("--iter=") {
+            iter = Some(parse_complex_constant(value).map_err(|err| format!("Invalid --iter: {err}"))?);
         } else if let Some(value) = arg.strip_prefix("--screenshot=") {
             if value.is_empty() {
                 return Err("--screenshot requires a file name".to_owned());
             }
             screenshot = Some(value.to_owned());
+        } else if let Some(value) = arg.strip_prefix("--csv=") {
+            if value.is_empty() {
+                return Err("--csv requires a file name".to_owned());
+            }
+            csv = Some(value.to_owned());
         } else if arg.starts_with("--") {
             return Err(format!("Unknown option '{arg}'"));
         } else {
@@ -635,6 +774,8 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
         visibility,
         colormap,
         screenshot,
+        csv,
+        iter,
     })
 }
 
@@ -654,6 +795,8 @@ struct Cli {
     visibility: SurfaceVisibility,
     colormap: ColorMap,
     screenshot: Option<String>,
+    csv: Option<String>,
+    iter: Option<C>,
 }
 
 #[derive(Clone, Copy)]
@@ -785,6 +928,7 @@ impl KeyRepeater {
 struct AppState {
     function_text: String,
     expr: Expr,
+    iterate: Option<Iterate>,
     domain: Domain,
     initial_domain: Domain,
     plot: Option<PlotData>,
@@ -823,8 +967,12 @@ impl AppState {
     }
 
     fn rebuild_plot(&mut self) {
+        let started = std::time::Instant::now();
         let plot = build_plot(
-            &self.expr,
+            Function {
+                expr: &self.expr,
+                iterate: self.iterate.as_ref(),
+            },
             self.domain,
             self.samples_per_axis,
             self.visibility(),
@@ -834,6 +982,16 @@ impl AppState {
             self.deriv_order,
             self.y_scale,
         );
+        if self.iterate.is_some() {
+            println!(
+                "Iterated grid {}x{} built in {:.2} s ({} finite of {} samples)",
+                self.samples_per_axis,
+                self.samples_per_axis,
+                started.elapsed().as_secs_f64(),
+                plot.finite_sample_count,
+                plot.total_sample_count
+            );
+        }
         self.status = format!(
             "domain re=[{}, {}] im=[{}, {}]  y=[{}, {}]  samples: {}x{}  finite: {}/{}  iso: {}({})  visible: {}{}{}{}",
             fmt_axis(self.domain.re.min),
@@ -958,6 +1116,8 @@ struct PlotData {
     total_sample_count: usize,
     samples_per_axis: usize,
     samples: Vec<Sample>,
+    domain: Domain,
+    deriv_order: u8,
     center_input: C,
     center_value: C,
 }
@@ -1183,21 +1343,63 @@ impl YScale {
 }
 
 
-fn eval_target(expr: &Expr, x: C, deriv_order: u8, h: f64) -> C {
+fn eval_target(f: Function, x: C, deriv_order: u8, h: f64) -> C {
     match deriv_order {
-        0 => expr.eval(x),
+        0 => f.eval(x),
         1 => {
             // Central difference along the real direction. Exact (up to O(h^2))
             // for holomorphic f; a directional derivative otherwise.
             let hc = C::new(h, 0.0);
-            (expr.eval(x + hc) - expr.eval(x - hc)) / C::new(2.0 * h, 0.0)
+            (f.eval(x + hc) - f.eval(x - hc)) / C::new(2.0 * h, 0.0)
         }
         _ => {
             let hc = C::new(h, 0.0);
-            (expr.eval(x + hc) - expr.eval(x) * C::new(2.0, 0.0) + expr.eval(x - hc))
-                / C::new(h * h, 0.0)
+            (f.eval(x + hc) - f.eval(x) * C::new(2.0, 0.0) + f.eval(x - hc)) / C::new(h * h, 0.0)
         }
     }
+}
+
+fn sample_at(f: Function, x: C, deriv_order: u8, h: f64) -> Sample {
+    let v = eval_target(f, x, deriv_order, h);
+    let abs = v.norm();
+    if v.re.is_finite() && v.im.is_finite() && abs.is_finite() {
+        Sample {
+            real: v.re,
+            imag: v.im,
+            abs,
+            arg: v.arg(),
+            valid: true,
+        }
+    } else {
+        Sample::invalid()
+    }
+}
+
+/// Evaluates the n x n grid, rows split across threads (samples are independent).
+fn sample_grid(f: Function, domain: Domain, n: usize, deriv_order: u8, h: f64) -> Vec<Sample> {
+    let steps = n - 1;
+    let mut samples = vec![Sample::invalid(); n * n];
+    let threads = std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(1)
+        .clamp(1, n);
+    let rows_per_thread = n.div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (chunk_index, chunk) in samples.chunks_mut(rows_per_thread * n).enumerate() {
+            let first_row = chunk_index * rows_per_thread;
+            scope.spawn(move || {
+                for (row, row_samples) in chunk.chunks_mut(n).enumerate() {
+                    let iz = first_row + row;
+                    let im = lerp_f64(domain.im.min, domain.im.max, iz as f64 / steps as f64);
+                    for (ix, out) in row_samples.iter_mut().enumerate() {
+                        let re = lerp_f64(domain.re.min, domain.re.max, ix as f64 / steps as f64);
+                        *out = sample_at(f, C::new(re, im), deriv_order, h);
+                    }
+                }
+            });
+        }
+    });
+    samples
 }
 
 fn deriv_step(domain: Domain, deriv_order: u8) -> f64 {
@@ -1219,7 +1421,7 @@ fn deriv_label(order: u8) -> &'static str {
 
 #[allow(clippy::too_many_arguments)]
 fn build_plot(
-    expr: &Expr,
+    f: Function,
     domain: Domain,
     samples_per_axis: usize,
     visibility: SurfaceVisibility,
@@ -1231,10 +1433,9 @@ fn build_plot(
 ) -> PlotData {
     let n = samples_per_axis;
     assert!(n >= 2);
-    let steps = n - 1;
     let h = deriv_step(domain, deriv_order);
 
-    let mut samples = vec![Sample::invalid(); n * n];
+    let samples = sample_grid(f, domain, n, deriv_order, h);
     let mut y_min = f64::INFINITY;
     let mut y_max = f64::NEG_INFINITY;
     let mut v_min = [f64::INFINITY; 4];
@@ -1242,36 +1443,17 @@ fn build_plot(
     let mut finite_sample_count = 0;
     let mut visible_value_count = 0usize;
 
-    for iz in 0..n {
-        let im = lerp_f64(domain.im.min, domain.im.max, iz as f64 / steps as f64);
-        for ix in 0..n {
-            let re = lerp_f64(domain.re.min, domain.re.max, ix as f64 / steps as f64);
-            let x = C::new(re, im);
-            let f = eval_target(expr, x, deriv_order, h);
-            let abs = f.norm();
-            let valid = f.re.is_finite() && f.im.is_finite() && abs.is_finite();
-            let idx = iz * n + ix;
-            if valid {
-                finite_sample_count += 1;
-                let sample = Sample {
-                    real: f.re,
-                    imag: f.im,
-                    abs,
-                    arg: f.arg(),
-                    valid: true,
-                };
-                samples[idx] = sample;
-                for kind in SurfaceKind::ALL {
-                    let tv = y_scale.apply(kind.raw_value(sample));
-                    let k = kind.index();
-                    v_min[k] = v_min[k].min(tv);
-                    v_max[k] = v_max[k].max(tv);
-                    if visibility.on(kind) {
-                        y_min = y_min.min(tv);
-                        y_max = y_max.max(tv);
-                        visible_value_count += 1;
-                    }
-                }
+    for sample in samples.iter().filter(|sample| sample.valid) {
+        finite_sample_count += 1;
+        for kind in SurfaceKind::ALL {
+            let tv = y_scale.apply(kind.raw_value(*sample));
+            let k = kind.index();
+            v_min[k] = v_min[k].min(tv);
+            v_max[k] = v_max[k].max(tv);
+            if visibility.on(kind) {
+                y_min = y_min.min(tv);
+                y_max = y_max.max(tv);
+                visible_value_count += 1;
             }
         }
     }
@@ -1334,7 +1516,7 @@ fn build_plot(
     }
 
     let center_input = C::new(domain.re.mid(), domain.im.mid());
-    let center_value = eval_target(expr, center_input, deriv_order, h);
+    let center_value = eval_target(f, center_input, deriv_order, h);
 
     PlotData {
         surfaces,
@@ -1343,6 +1525,8 @@ fn build_plot(
         total_sample_count: n * n,
         samples_per_axis: n,
         samples,
+        domain,
+        deriv_order,
         center_input,
         center_value,
     }
@@ -2175,21 +2359,29 @@ fn draw_hud(state: &AppState) {
     let font_size = 19.0;
     let line = 22.0;
 
-    draw_text(
-        &format!(
-            "f(x) = {}{}",
-            state.function_text,
-            match state.deriv_order {
-                0 => String::new(),
-                o => format!("   [showing {}(x), numeric]", deriv_label(o)),
-            }
+    let shown = match (&state.iterate, state.deriv_order) {
+        (None, 0) => String::new(),
+        (None, o) => format!("   [showing {}(x), numeric]", deriv_label(o)),
+        (Some(iterate), 0) => format!("   [showing f^t(x), t = {}, numeric]", iterate.count_label()),
+        (Some(iterate), o) => format!(
+            "   [showing ({}^t)(x), t = {}, numeric]",
+            deriv_label(o),
+            iterate.count_label()
         ),
+    };
+    draw_text(
+        &format!("f(x) = {}{}", state.function_text, shown),
         14.0,
         y,
         font_size,
         BLACK,
     );
     y += line;
+
+    if let Some(iterate) = &state.iterate {
+        draw_text(&format!("iter {}", iterate.describe()), 14.0, y, font_size, BLACK);
+        y += line;
+    }
 
     if let Some(plot) = &state.plot {
         draw_text(
@@ -2302,7 +2494,7 @@ fn draw_hud(state: &AppState) {
             "V cycle derivative: f / f' / f'' (numeric, on the fly)",
             "G cycle vertical scale: linear / arsinh / log10",
             "I toggle iso-value lines, U/O decrease/increase iso-line count",
-            "0 reset domain, P save PNG, Esc quit",
+            "0 reset domain, P save PNG, Y save CSV (grid, im=0 and re=0 lines), Esc quit",
         ];
         for item in help {
             draw_text(item, 14.0, y, font_size, BLACK);
@@ -2416,6 +2608,515 @@ fn on_off(v: bool) -> &'static str {
     if v { "on" } else { "off" }
 }
 
+fn fmt_complex(c: C) -> String {
+    format!(
+        "{}{}{}i",
+        fmt_axis(c.re),
+        if c.im < 0.0 { "-" } else { "+" },
+        fmt_axis(c.im.abs())
+    )
+}
+
+// -----------------------------
+// Fractional (complex-order) iteration
+// -----------------------------
+//
+// f^t(z) = Φ(λ^t ψ(z)) at a hyperbolic fixed point p of f (regular / Schröder
+// iteration). ψ is the Koenigs function (ψ(f(z)) = λ ψ(z), ψ(p) = 0, ψ'(p) = 1),
+// Φ = ψ⁻¹. Both are power series at p. Repelling p: Φ extends everywhere by forward
+// iteration of f and ψ = Φ⁻¹ is obtained by Newton continuation along the straight
+// segment from p; attracting p: ψ extends by forward orbits and Φ = ψ⁻¹ is
+// continued the same way. That gives one canonical branch for every sample point.
+// Everything is purely numerical: f is only ever evaluated as a black box.
+
+const ITER_DFT_SAMPLES: usize = 256;
+const ITER_SERIES_TERMS: usize = 40;
+const ITER_SERIES_TAIL_TOL: f64 = 1e-10;
+const ITER_MAX_ORBIT_STEPS: usize = 200;
+const ITER_MAX_COMPOSE: usize = 1000;
+
+/// A plotted function: the parsed expression, optionally iterated `t` times.
+#[derive(Clone, Copy)]
+struct Function<'a> {
+    expr: &'a Expr,
+    iterate: Option<&'a Iterate>,
+}
+
+impl<'a> Function<'a> {
+    #[cfg(test)]
+    fn plain(expr: &'a Expr) -> Self {
+        Self { expr, iterate: None }
+    }
+
+    fn eval(&self, x: C) -> C {
+        match self.iterate {
+            None => self.expr.eval(x),
+            Some(iterate) => iterate.eval(self.expr, x),
+        }
+    }
+}
+
+enum Iterate {
+    Identity,
+    Compose(usize),
+    Regular(RegularIterate),
+}
+
+impl Iterate {
+    /// `Ok(None)` for `t == 1`: the plain function, evaluated exactly as without `--iter`.
+    fn for_count(expr: &Expr, t: C, domain: Domain) -> Result<Option<Self>, String> {
+        if t.im == 0.0 && t.re >= 0.0 && t.re.fract() == 0.0 && t.re <= ITER_MAX_COMPOSE as f64 {
+            return Ok(match t.re as usize {
+                0 => Some(Iterate::Identity),
+                1 => None,
+                n => Some(Iterate::Compose(n)),
+            });
+        }
+        RegularIterate::new(expr, t, domain).map(|r| Some(Iterate::Regular(r)))
+    }
+
+    fn eval(&self, expr: &Expr, z: C) -> C {
+        match self {
+            Iterate::Identity => z,
+            Iterate::Compose(n) => {
+                let mut w = z;
+                for _ in 0..*n {
+                    w = expr.eval(w);
+                }
+                w
+            }
+            Iterate::Regular(r) => r.eval(expr, z).unwrap_or(C::new(f64::NAN, f64::NAN)),
+        }
+    }
+
+    fn count_label(&self) -> String {
+        match self {
+            Iterate::Identity => "0".to_owned(),
+            Iterate::Compose(n) => n.to_string(),
+            Iterate::Regular(r) => fmt_complex(r.t),
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Iterate::Identity => "t=0: identity".to_owned(),
+            Iterate::Compose(n) => format!("t={n}: direct {n}-fold composition"),
+            Iterate::Regular(r) => format!(
+                "t={}: regular iteration at fixed point p={}  lambda={} |lambda|={} ({})  series radii {} / {}",
+                fmt_complex(r.t),
+                fmt_complex(r.p),
+                fmt_complex(r.lambda),
+                fmt_axis(r.lambda.norm()),
+                if r.attracting { "attracting" } else { "repelling" },
+                fmt_axis(r.r_phi),
+                fmt_axis(r.r_psi),
+            ),
+        }
+    }
+}
+
+struct RegularIterate {
+    t: C,
+    p: C,
+    lambda: C,
+    mu: C,
+    attracting: bool,
+    /// Φ(p + w) - p = Σ phi[k] w^k (phi[0] = 0, phi[1] = 1).
+    phi: Vec<C>,
+    /// ψ(p + u) = Σ psi[k] u^k (psi[0] = 0, psi[1] = 1).
+    psi: Vec<C>,
+    r_phi: f64,
+    r_psi: f64,
+}
+
+impl RegularIterate {
+    fn new(expr: &Expr, t: C, domain: Domain) -> Result<Self, String> {
+        let center = C::new(domain.re.mid(), domain.im.mid());
+        let scale = domain.re.len().max(domain.im.len());
+        let (p, _) = find_fixed_points(expr, domain)
+            .into_iter()
+            .find(|(_, lambda)| is_hyperbolic(*lambda))
+            .ok_or_else(|| {
+                format!(
+                    "no hyperbolic fixed point of f (f(p) = p with 0 < |f'(p)| != 1) found near {}; \
+                     regular iteration needs one - try another domain",
+                    fmt_complex(center)
+                )
+            })?;
+        Self::at(expr, t, p, scale)
+    }
+
+    fn at(expr: &Expr, t: C, p: C, scale: f64) -> Result<Self, String> {
+        let (coeffs, r_dft) = taylor_coefficients(expr, p, scale)?;
+        let lambda = coeffs[1];
+        if !is_hyperbolic(lambda) {
+            return Err(format!("fixed point {} is not hyperbolic", fmt_complex(p)));
+        }
+        let (phi, psi) = schroeder_series(&coeffs, lambda);
+        let r_phi = series_radius(&phi, 0.5 * r_dft);
+        let r_psi = series_radius(&psi, 0.5 * r_dft);
+        if r_phi <= 1e-9 * (1.0 + p.norm()) || r_psi <= 1e-9 * (1.0 + p.norm()) {
+            return Err(format!("conjugacy series at fixed point {} do not converge", fmt_complex(p)));
+        }
+        Ok(Self {
+            t,
+            p,
+            lambda,
+            mu: lambda.powc(t),
+            attracting: lambda.norm() < 1.0,
+            phi,
+            psi,
+            r_phi,
+            r_psi,
+        })
+    }
+
+    fn eval(&self, expr: &Expr, z: C) -> Option<C> {
+        let zero = C::new(0.0, 0.0);
+        if self.attracting {
+            let u = self.koenigs_forward(expr, z)?;
+            continue_inverse(&|w| self.koenigs_forward(expr, w), self.p, zero, self.mu * u)
+        } else {
+            let u = continue_inverse(&|w| self.inverse_koenigs_forward(expr, w), zero, self.p, z)?;
+            self.inverse_koenigs_forward(expr, self.mu * u)
+        }
+    }
+
+    /// ψ(z) for attracting p: follow the orbit into the series disk, undo with powers of λ.
+    fn koenigs_forward(&self, expr: &Expr, z: C) -> Option<C> {
+        let mut z = z;
+        let mut steps = 0i32;
+        while (z - self.p).norm() > self.r_psi {
+            if steps as usize >= ITER_MAX_ORBIT_STEPS {
+                return None;
+            }
+            z = expr.eval(z);
+            if !is_finite_c(z) {
+                return None;
+            }
+            steps += 1;
+        }
+        let value = eval_series(&self.psi, z - self.p) * self.lambda.powi(-steps);
+        is_finite_c(value).then_some(value)
+    }
+
+    /// Φ(u) for repelling p: shrink u into the series disk with powers of λ, then iterate f.
+    fn inverse_koenigs_forward(&self, expr: &Expr, u: C) -> Option<C> {
+        let ratio = u.norm() / self.r_phi;
+        let steps = if ratio > 1.0 {
+            (ratio.ln() / self.lambda.norm().ln()).ceil() as usize
+        } else {
+            0
+        };
+        if steps > ITER_MAX_ORBIT_STEPS {
+            return None;
+        }
+        let mut w = self.p + eval_series(&self.phi, u / self.lambda.powi(steps as i32));
+        for _ in 0..steps {
+            w = expr.eval(w);
+            if !is_finite_c(w) {
+                return None;
+            }
+        }
+        Some(w)
+    }
+}
+
+fn is_finite_c(c: C) -> bool {
+    c.re.is_finite() && c.im.is_finite()
+}
+
+fn is_hyperbolic(lambda: C) -> bool {
+    lambda.norm() > 1e-4 && (lambda.norm() - 1.0).abs() > 1e-4
+}
+
+fn central_derivative<F: Fn(C) -> Option<C>>(f: &F, w: C) -> Option<C> {
+    let h = 1e-6 * (1.0 + w.norm());
+    let hc = C::new(h, 0.0);
+    let d = (f(w + hc)? - f(w - hc)?) / C::new(2.0 * h, 0.0);
+    is_finite_c(d).then_some(d)
+}
+
+fn derivative(expr: &Expr, w: C) -> C {
+    central_derivative(&|z| Some(expr.eval(z)), w).unwrap_or(C::new(f64::NAN, f64::NAN))
+}
+
+/// Newton iteration for f(w) = target from `w`; returns the root and the iteration count.
+fn newton_solve<F: Fn(C) -> Option<C>>(f: &F, target: C, mut w: C) -> Option<(C, usize)> {
+    for iteration in 1..=16 {
+        let residual = f(w)? - target;
+        if !is_finite_c(residual) {
+            return None;
+        }
+        if residual.norm() <= 1e-14 * (1.0 + target.norm()) {
+            return Some((w, iteration));
+        }
+        let dw = central_derivative(f, w)?;
+        if dw.norm() < 1e-300 {
+            return None;
+        }
+        let step = residual / dw;
+        w -= step;
+        if !is_finite_c(w) {
+            return None;
+        }
+        if step.norm() <= 1e-11 * (1.0 + w.norm()) {
+            return Some((w, iteration));
+        }
+    }
+    None
+}
+
+/// The branch of f⁻¹ with f⁻¹(from_val) = from_arg, continued along the straight segment
+/// from `from_val` to `to_val`: predictor-corrector Newton with adaptive steps, each step
+/// cross-checked against two half steps so that hopping onto another sheet is rejected.
+fn continue_inverse<F: Fn(C) -> Option<C>>(f: &F, from_arg: C, from_val: C, to_val: C) -> Option<C> {
+    let d = to_val - from_val;
+    if d.norm() <= 1e-15 * (1.0 + to_val.norm()) {
+        return Some(from_arg);
+    }
+    let mut w = from_arg;
+    let mut s = 0.0f64;
+    let mut ds = 0.25f64;
+    let mut attempts = 0;
+    while s < 1.0 {
+        attempts += 1;
+        if attempts > 128 {
+            return None;
+        }
+        let step = ds.min(1.0 - s);
+        let full = corrector_step(f, w, from_val + d * s, d, step);
+        let half = corrector_step(f, w, from_val + d * s, d, 0.5 * step)
+            .and_then(|(w1, _)| corrector_step(f, w1, from_val + d * (s + 0.5 * step), d, 0.5 * step));
+        match (full, half) {
+            (Some((w_full, _)), Some((w_half, iterations)))
+                if (w_full - w_half).norm() <= 1e-8 * (1.0 + w_half.norm()) =>
+            {
+                w = w_half;
+                s += step;
+                if iterations <= 4 {
+                    ds = (ds * 2.0).min(1.0);
+                }
+            }
+            _ => {
+                ds *= 0.5;
+                if ds < 1.0 / 4096.0 {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(w)
+}
+
+/// One continuation step from `w` (where f(w) = value) by `step` along direction `d`.
+fn corrector_step<F: Fn(C) -> Option<C>>(f: &F, w: C, value: C, d: C, step: f64) -> Option<(C, usize)> {
+    let dw = central_derivative(f, w).filter(|dw| dw.norm() >= 1e-300)?;
+    let predictor = w + d * step / dw;
+    newton_solve(f, value + d * step, predictor)
+        .filter(|(root, _)| (root - predictor).norm() <= 0.5 * (predictor - w).norm() + 1e-9 * (1.0 + w.norm()))
+}
+
+/// Newton on f(z) - z from `seed`.
+fn newton_fixed_point(expr: &Expr, seed: C) -> Option<C> {
+    let one = C::new(1.0, 0.0);
+    let mut z = seed;
+    for _ in 0..100 {
+        let residual = expr.eval(z) - z;
+        let dz = derivative(expr, z) - one;
+        if !is_finite_c(residual) || !is_finite_c(dz) || dz.norm() < 1e-300 {
+            return None;
+        }
+        let step = residual / dz;
+        z -= step;
+        if !is_finite_c(z) {
+            return None;
+        }
+        if step.norm() <= 1e-13 * (1.0 + z.norm()) {
+            let check = expr.eval(z) - z;
+            return (check.norm() <= 1e-8 * (1.0 + z.norm())).then_some(z);
+        }
+    }
+    None
+}
+
+/// Fixed points (p, f'(p)) found from seeds over the domain, nearest to the domain center first.
+fn find_fixed_points(expr: &Expr, domain: Domain) -> Vec<(C, C)> {
+    let center = C::new(domain.re.mid(), domain.im.mid());
+    let mut seeds = vec![center];
+    for scale in [1.0, 3.0] {
+        for i in 0..7 {
+            for j in 0..7 {
+                seeds.push(C::new(
+                    center.re + scale * domain.re.len() * (i as f64 / 6.0 - 0.5),
+                    center.im + scale * domain.im.len() * (j as f64 / 6.0 - 0.5),
+                ));
+            }
+        }
+    }
+    let mut found: Vec<(C, C)> = Vec::new();
+    for seed in seeds {
+        let Some(p) = newton_fixed_point(expr, seed) else {
+            continue;
+        };
+        if found.iter().any(|(q, _)| (q - p).norm() <= 1e-7 * (1.0 + p.norm())) {
+            continue;
+        }
+        let lambda = derivative(expr, p);
+        if is_finite_c(lambda) {
+            found.push((p, lambda));
+        }
+    }
+    // Deterministic order: repelling points first (their iterate extends to the whole
+    // plane, an attracting one only covers its basin), then distance to the center
+    // (ties: larger Im, then larger Re first).
+    let bucket = |p: C| ((p - center).norm() * 1e8).round() as i64;
+    found.sort_by(|a, b| {
+        (a.1.norm() < 1.0)
+            .cmp(&(b.1.norm() < 1.0))
+            .then(bucket(a.0).cmp(&bucket(b.0)))
+            .then((-a.0.im).total_cmp(&(-b.0.im)))
+            .then((-a.0.re).total_cmp(&(-b.0.re)))
+    });
+    found
+}
+
+/// Taylor coefficients c_0..c_K of f at p from samples on a circle (Cauchy integral by DFT).
+/// The radius is halved until the truncated series reproduces f on the half-radius circle.
+fn taylor_coefficients(expr: &Expr, p: C, scale: f64) -> Result<(Vec<C>, f64), String> {
+    let mut r = 0.5 * scale.max(1e-6);
+    for _ in 0..24 {
+        if let Some(coeffs) = dft_coefficients(expr, p, r) {
+            let check_r = 0.5 * r;
+            let mut max_abs = 0.0f64;
+            let mut max_err = 0.0f64;
+            let mut finite = true;
+            for m in 0..32 {
+                let angle = std::f64::consts::TAU * (m as f64 + 0.5) / 32.0;
+                let v = C::from_polar(check_r, angle);
+                let f = expr.eval(p + v);
+                if !is_finite_c(f) {
+                    finite = false;
+                    break;
+                }
+                max_abs = max_abs.max(f.norm());
+                max_err = max_err.max((eval_series(&coeffs, v) - f).norm());
+            }
+            if finite && max_err <= 1e-9 * (max_abs + 1e-300) {
+                return Ok((coeffs, r));
+            }
+        }
+        r *= 0.5;
+    }
+    Err(format!(
+        "f does not look analytic around the fixed point {} (no Taylor expansion found)",
+        fmt_complex(p)
+    ))
+}
+
+fn dft_coefficients(expr: &Expr, p: C, r: f64) -> Option<Vec<C>> {
+    let n = ITER_DFT_SAMPLES;
+    let mut samples = Vec::new();
+    for m in 0..n {
+        let angle = std::f64::consts::TAU * m as f64 / n as f64;
+        let f = expr.eval(p + C::from_polar(r, angle));
+        if !is_finite_c(f) {
+            return None;
+        }
+        samples.push(f);
+    }
+    let mut coeffs = Vec::new();
+    for j in 0..=ITER_SERIES_TERMS {
+        let mut sum = C::new(0.0, 0.0);
+        for (m, f) in samples.iter().enumerate() {
+            let angle = -std::f64::consts::TAU * ((j * m) % n) as f64 / n as f64;
+            sum += f * C::from_polar(1.0, angle);
+        }
+        coeffs.push(sum / (n as f64 * r.powi(j as i32)));
+    }
+    Some(coeffs)
+}
+
+/// Σ coeffs[k] v^k (Horner).
+fn eval_series(coeffs: &[C], v: C) -> C {
+    coeffs.iter().rev().fold(C::new(0.0, 0.0), |acc, c| acc * v + c)
+}
+
+fn poly_mul(a: &[C], b: &[C], degree: usize) -> Vec<C> {
+    let mut out = vec![C::new(0.0, 0.0); degree + 1];
+    for (i, ai) in a.iter().enumerate().take(degree + 1) {
+        for (j, bj) in b.iter().enumerate().take(degree + 1 - i) {
+            out[i + j] += ai * bj;
+        }
+    }
+    out
+}
+
+/// Power series of Φ - p (inverse Koenigs) and ψ (Koenigs) at the fixed point from the
+/// Taylor coefficients `c` of f there (c[1] = λ), via the Schröder functional equations.
+fn schroeder_series(c: &[C], lambda: C) -> (Vec<C>, Vec<C>) {
+    let k = ITER_SERIES_TERMS;
+    let zero = C::new(0.0, 0.0);
+
+    // Φ(λw) = f(Φ(w)):  λ^m a_m = Σ_{j=1..m} c_j [w^m] V^j,  V = Σ a_k w^k.
+    let mut phi = vec![zero; k + 1];
+    phi[1] = C::new(1.0, 0.0);
+    for m in 2..=k {
+        let mut power = phi.clone();
+        let mut sum = zero;
+        for cj in &c[2..=m] {
+            power = poly_mul(&power, &phi, m);
+            sum += cj * power[m];
+        }
+        phi[m] = sum / (lambda.powi(m as i32) - lambda);
+    }
+
+    // ψ(F(u)) = λ ψ(u),  F(u) = f(p+u) - p = Σ_{j>=1} c_j u^j:  Σ_{k<=m} b_k [u^m] F^k = λ b_m.
+    let mut f_series: Vec<C> = c[..=k].to_vec();
+    f_series[0] = zero;
+    let mut f_powers = vec![f_series.clone()];
+    for _ in 2..=k {
+        let next = poly_mul(f_powers.last().unwrap(), &f_series, k);
+        f_powers.push(next);
+    }
+    let mut psi = vec![zero; k + 1];
+    psi[1] = C::new(1.0, 0.0);
+    for m in 2..=k {
+        let mut sum = zero;
+        for j in 1..m {
+            sum += psi[j] * f_powers[j - 1][m];
+        }
+        psi[m] = sum / (lambda - lambda.powi(m as i32));
+    }
+    (phi, psi)
+}
+
+/// Radius at which the tail of the truncated series is negligible (bounded by `r_max`).
+fn series_radius(coeffs: &[C], r_max: f64) -> f64 {
+    let k = coeffs.len() - 1;
+    let mut r = r_max;
+    for (degree, c) in coeffs.iter().enumerate().skip(k / 2) {
+        let a = c.norm();
+        if a > 0.0 {
+            r = r.min((ITER_SERIES_TAIL_TOL / a).powf(1.0 / degree as f64));
+        }
+    }
+    r
+}
+
+/// Parses a constant complex expression such as `0.5`, `i`, `-.125-.02i` or `2*pi`.
+fn parse_complex_constant(text: &str) -> Result<C, String> {
+    let expr = Parser::parse(text)?;
+    if expr.contains_var() {
+        return Err("expected a constant, but the expression depends on x".to_owned());
+    }
+    let value = expr.eval(C::new(0.0, 0.0));
+    if !is_finite_c(value) {
+        return Err(format!("`{text}` is not a finite number"));
+    }
+    Ok(value)
+}
+
 // -----------------------------
 // Expression parser and evaluator
 // -----------------------------
@@ -2430,6 +3131,16 @@ enum Expr {
 }
 
 impl Expr {
+    fn contains_var(&self) -> bool {
+        match self {
+            Expr::Const(_) => false,
+            Expr::Var => true,
+            Expr::Unary(_, arg) => arg.contains_var(),
+            Expr::Binary(_, left, right) => left.contains_var() || right.contains_var(),
+            Expr::Func(_, args) => args.iter().any(Expr::contains_var),
+        }
+    }
+
     fn eval(&self, x: C) -> C {
         match self {
             Expr::Const(c) => *c,
@@ -3219,15 +3930,15 @@ mod tests {
         let h1 = deriv_step(domain, 1);
         let h2 = deriv_step(domain, 2);
         // d/dx x^3 = 3x^2 -> 3(1+i)^2 = 6i
-        assert_close(eval_target(&expr, x, 1, h1), C::new(0.0, 6.0), 1e-6);
+        assert_close(eval_target(Function::plain(&expr), x, 1, h1), C::new(0.0, 6.0), 1e-6);
         // d2/dx2 x^3 = 6x -> 6+6i
-        assert_close(eval_target(&expr, x, 2, h2), C::new(6.0, 6.0), 1e-4);
+        assert_close(eval_target(Function::plain(&expr), x, 2, h2), C::new(6.0, 6.0), 1e-4);
 
         let expr = Parser::parse("exp(x)").unwrap();
         let x = C::new(0.5, -0.25);
         let expected = x.exp();
-        assert_close(eval_target(&expr, x, 1, h1), expected, 1e-6);
-        assert_close(eval_target(&expr, x, 2, h2), expected, 1e-4);
+        assert_close(eval_target(Function::plain(&expr), x, 1, h1), expected, 1e-6);
+        assert_close(eval_target(Function::plain(&expr), x, 2, h2), expected, 1e-4);
     }
 
     #[test]
@@ -3407,7 +4118,7 @@ mod tests {
         let colormap = ColorMap::parse("3,(0,0,0),(1,0,0),(1,1,1)").unwrap();
         let n = 9;
         let plot = build_plot(
-            &expr,
+            Function::plain(&expr),
             domain,
             n,
             visibility,
@@ -3488,6 +4199,7 @@ mod tests {
         assert_eq!(cli.visibility, SurfaceVisibility::default());
         assert_eq!(cli.colormap, ColorMap::default());
         assert!(cli.screenshot.is_none());
+        assert!(cli.csv.is_none());
         assert_eq!((cli.re.min, cli.re.max, cli.im.min, cli.im.max), (-2.0, 2.0, -2.0, 2.0));
 
         let cli = parse_cli(&args(&[
@@ -3495,6 +4207,7 @@ mod tests {
             "--show=im,arg",
             "--colormap=3,(0,0,0),(1,0,0),(1,1,1)",
             "--screenshot=out.png",
+            "--csv=values.csv",
             "-x",
             "-1",
             "1.5",
@@ -3515,6 +4228,7 @@ mod tests {
         );
         assert_eq!(cli.colormap.stops, vec![(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 1.0)]);
         assert_eq!(cli.screenshot.as_deref(), Some("out.png"));
+        assert_eq!(cli.csv.as_deref(), Some("values.csv"));
         assert_eq!((cli.re.min, cli.re.max, cli.im.min, cli.im.max), (-1.0, 1.5, -2.0, 3.0));
 
         assert!(parse_cli(&args(&["x", "1"])).is_err());
@@ -3524,6 +4238,7 @@ mod tests {
         assert!(parse_cli(&args(&["--show=re,foo", "x"])).is_err());
         assert!(parse_cli(&args(&["--colormap=2,(0,0,0)", "x"])).is_err());
         assert!(parse_cli(&args(&["--screenshot=", "x"])).is_err());
+        assert!(parse_cli(&args(&["--csv=", "x"])).is_err());
         assert!(parse_cli(&args(&["--bogus", "x"])).is_err());
         assert!(parse_cli(&args(&["--x"])).is_err());
         // "--" ends option parsing so double-negated expressions still work.
@@ -3570,7 +4285,7 @@ mod tests {
         // Odd sample count puts a sample exactly on the pole at 0.
         let colormap = ColorMap::default();
         let plot = build_plot(
-            &expr,
+            Function::plain(&expr),
             domain,
             21,
             visibility,
@@ -3613,7 +4328,7 @@ mod tests {
         let colormap = ColorMap::default();
         let n = 9;
         let plot = build_plot(
-            &expr,
+            Function::plain(&expr),
             domain,
             n,
             visibility,
@@ -3636,5 +4351,300 @@ mod tests {
         // Surfaces that are hidden get no contours, but keep their range.
         assert!(plot.surface(SurfaceKind::Imag).iso_lines.is_empty());
         assert!(plot.surface(SurfaceKind::Imag).value_range.is_some());
+    }
+
+    fn square_domain(center: C, half: f64) -> Domain {
+        Domain {
+            re: Range::new(center.re - half, center.re + half).unwrap(),
+            im: Range::new(center.im - half, center.im + half).unwrap(),
+        }
+    }
+
+    fn iterate(function: &str, t: C, domain: Domain) -> (Expr, Iterate) {
+        let expr = Parser::parse(function).unwrap();
+        let iterate = Iterate::for_count(&expr, t, domain)
+            .unwrap_or_else(|err| panic!("{err}"))
+            .expect("t != 1");
+        (expr, iterate)
+    }
+
+    #[test]
+    fn parses_complex_constants() {
+        assert_close(parse_complex_constant("-.125-.02i").unwrap(), C::new(-0.125, -0.02), 1e-15);
+        assert_close(parse_complex_constant("i").unwrap(), C::new(0.0, 1.0), 1e-15);
+        assert_close(parse_complex_constant("0.5").unwrap(), C::new(0.5, 0.0), 1e-15);
+        assert_close(parse_complex_constant("10+3i").unwrap(), C::new(10.0, 3.0), 1e-15);
+        assert_close(parse_complex_constant("2*pi").unwrap(), C::new(std::f64::consts::TAU, 0.0), 1e-15);
+        assert!(parse_complex_constant("x").is_err());
+        assert!(parse_complex_constant("2+").is_err());
+        assert!(parse_complex_constant("1/0").is_err());
+        let cli = parse_cli(&["--iter=-.125-.02i".to_owned(), "exp(x)".to_owned()]).unwrap();
+        assert_close(cli.iter.unwrap(), C::new(-0.125, -0.02), 1e-15);
+        assert!(parse_cli(&["--iter=x".to_owned(), "exp(x)".to_owned()]).is_err());
+        assert!(parse_cli(&["exp(x)".to_owned()]).unwrap().iter.is_none());
+    }
+
+    #[test]
+    fn integer_iteration_counts_compose_directly() {
+        let expr = Parser::parse("x^2+0.25i").unwrap();
+        let domain = square_domain(C::new(0.0, 0.0), 2.0);
+        assert!(Iterate::for_count(&expr, C::new(1.0, 0.0), domain).unwrap().is_none());
+        let identity = Iterate::for_count(&expr, C::new(0.0, 0.0), domain).unwrap().unwrap();
+        let twice = Iterate::for_count(&expr, C::new(2.0, 0.0), domain).unwrap().unwrap();
+        let thrice = Iterate::for_count(&expr, C::new(3.0, 0.0), domain).unwrap().unwrap();
+        for z in [C::new(0.3, -0.7), C::new(-1.2, 0.4), C::new(0.0, 0.0)] {
+            assert_eq!(identity.eval(&expr, z), z);
+            assert_eq!(twice.eval(&expr, z), expr.eval(expr.eval(z)));
+            assert_eq!(thrice.eval(&expr, z), expr.eval(expr.eval(expr.eval(z))));
+        }
+        let f = Function { expr: &expr, iterate: Some(&twice) };
+        assert_eq!(f.eval(C::new(0.5, 0.5)), expr.eval(expr.eval(C::new(0.5, 0.5))));
+        assert_eq!(Function::plain(&expr).eval(C::new(0.5, 0.5)), expr.eval(C::new(0.5, 0.5)));
+    }
+
+    #[test]
+    fn affine_iterate_matches_closed_form() {
+        // f(z) = 2z + 1: fixed point -1, multiplier 2, f^t(z) = 2^t (z + 1) - 1.
+        let domain = square_domain(C::new(0.0, 0.0), 2.0);
+        for t in [C::new(0.5, 0.0), C::new(0.0, 1.0), C::new(-1.0, 0.0), C::new(1.7, -0.3)] {
+            let (expr, iterate) = iterate("2x+1", t, domain);
+            let mu = C::new(2.0, 0.0).powc(t);
+            for z in [C::new(0.0, 0.0), C::new(1.5, -0.5), C::new(-3.0, 2.0), C::new(0.2, 0.1)] {
+                let expected = mu * (z + C::new(1.0, 0.0)) - C::new(1.0, 0.0);
+                assert_close(iterate.eval(&expr, z), expected, 1e-8 * (1.0 + expected.norm()));
+            }
+        }
+    }
+
+    #[test]
+    fn moebius_iterate_matches_closed_form_at_both_fixed_points() {
+        // f(z) = 2z/(1+z) is conjugate to w -> 2w; f^t(z) = 2^t z / (1 + (2^t - 1) z).
+        // Fixed point 0 is repelling (multiplier 2), fixed point 1 attracting (1/2).
+        let t = C::new(0.5, 0.0);
+        let mu = C::new(2.0, 0.0).powc(t);
+        let points = [C::new(0.3, 0.2), C::new(0.0, -0.4), C::new(2.0, 1.0), C::new(-0.3, 0.6), C::new(0.9, 0.05)];
+        let expr = Parser::parse("2x/(1+x)").unwrap();
+        let at_zero = Iterate::for_count(&expr, t, square_domain(C::new(0.0, 0.0), 0.5)).unwrap().unwrap();
+        let Iterate::Regular(at_zero) = at_zero else { panic!("expected regular iteration") };
+        let at_one = RegularIterate::at(&expr, t, C::new(1.0, 0.0), 1.0).unwrap();
+        assert!(!at_zero.attracting);
+        assert!(at_one.attracting);
+        assert_close(at_zero.p, C::new(0.0, 0.0), 1e-9);
+        for regular in [&at_zero, &at_one] {
+            for z in points {
+                let expected = mu * z / (C::new(1.0, 0.0) + (mu - C::new(1.0, 0.0)) * z);
+                let actual = regular.eval(&expr, z).unwrap_or_else(|| panic!("f^t({z}) failed at p={}", regular.p));
+                assert_close(actual, expected, 1e-7 * (1.0 + expected.norm()));
+            }
+        }
+    }
+
+    #[test]
+    fn square_iterate_is_a_power() {
+        // f(z) = z^2 at the repelling fixed point 1: f^t(z) = z^(2^t) (principal branch).
+        let t = C::new(0.5, 0.0);
+        let (expr, iterate) = iterate("x^2", t, square_domain(C::new(0.0, 0.0), 2.0));
+        let power = C::new(2.0f64.sqrt(), 0.0);
+        for z in [C::new(2.0, 0.0), C::new(1.0, 1.0), C::new(0.5, -0.3), C::new(-0.2, 1.5)] {
+            let expected = z.powc(power);
+            assert_close(iterate.eval(&expr, z), expected, 1e-8 * (1.0 + expected.norm()));
+        }
+    }
+
+    #[test]
+    fn exp_half_iterate_composes_to_exp() {
+        let domain = square_domain(C::new(0.0, 0.0), 2.0);
+        let (expr, iterate) = iterate("exp(x)", C::new(0.5, 0.0), domain);
+        let Iterate::Regular(regular) = &iterate else { panic!("expected regular iteration") };
+        assert_close(regular.p, C::new(0.318131505204764, 1.337235701430689), 1e-9);
+        assert!(!regular.attracting);
+
+        let n = 9;
+        let mut checked = 0;
+        let mut good = 0;
+        for iz in 0..n {
+            for ix in 0..n {
+                let z = C::new(
+                    lerp_f64(-2.0, 2.0, ix as f64 / (n - 1) as f64),
+                    lerp_f64(-2.0, 2.0, iz as f64 / (n - 1) as f64),
+                );
+                let h = iterate.eval(&expr, z);
+                if !is_finite_c(h) {
+                    continue;
+                }
+                let hh = iterate.eval(&expr, h);
+                if !is_finite_c(hh) {
+                    continue;
+                }
+                checked += 1;
+                let expected = z.exp();
+                if (hh - expected).norm() <= 1e-6 * (1.0 + expected.norm()) {
+                    good += 1;
+                }
+            }
+        }
+        assert!(checked >= n * n * 3 / 4, "only {checked} of {} points finite", n * n);
+        assert!(good * 10 >= checked * 9, "h(h(z)) = exp(z) at only {good} of {checked} points");
+    }
+
+    #[test]
+    fn iteration_without_hyperbolic_fixed_point_is_an_error() {
+        let expr = Parser::parse("x+1").unwrap();
+        let domain = square_domain(C::new(0.0, 0.0), 2.0);
+        assert!(Iterate::for_count(&expr, C::new(0.5, 0.0), domain).is_err());
+    }
+
+    #[test]
+    fn build_plot_uses_the_iterate() {
+        let expr = Parser::parse("x^2").unwrap();
+        let domain = square_domain(C::new(0.0, 0.0), 1.0);
+        let twice = Iterate::for_count(&expr, C::new(2.0, 0.0), domain).unwrap().unwrap();
+        let colormap = ColorMap::default();
+        let n = 7;
+        let plot = build_plot(
+            Function { expr: &expr, iterate: Some(&twice) },
+            domain,
+            n,
+            SurfaceVisibility::default(),
+            shading(ColorMode::Solid, false, &colormap),
+            false,
+            0,
+            0,
+            YScale::Linear,
+        );
+        assert_eq!(plot.finite_sample_count, n * n);
+        for (idx, sample) in plot.samples.iter().enumerate() {
+            let z = C::new(
+                lerp_f64(-1.0, 1.0, (idx % n) as f64 / (n - 1) as f64),
+                lerp_f64(-1.0, 1.0, (idx / n) as f64 / (n - 1) as f64),
+            );
+            let expected = z * z * z * z;
+            assert_close(C::new(sample.real, sample.imag), expected, 1e-12);
+        }
+        assert_close(plot.center_value, C::new(0.0, 0.0), 1e-15);
+    }
+
+    fn csv_plot(function: &str, domain: Domain, n: usize) -> (Expr, PlotData) {
+        let expr = Parser::parse(function).unwrap();
+        let colormap = ColorMap::default();
+        let plot = build_plot(
+            Function::plain(&expr),
+            domain,
+            n,
+            SurfaceVisibility::default(),
+            shading(ColorMode::Solid, false, &colormap),
+            false,
+            0,
+            0,
+            YScale::Linear,
+        );
+        (expr, plot)
+    }
+
+    fn csv_fields(line: &str) -> Vec<f64> {
+        line.split(',')
+            .map(|field| if field.is_empty() { f64::NAN } else { field.parse::<f64>().unwrap() })
+            .collect()
+    }
+
+    #[test]
+    fn csv_row_formats_numbers_and_leaves_invalid_values_empty() {
+        let mut out = String::new();
+        csv_row(&mut out, &[0.5, -2.0], Sample::invalid());
+        csv_row(
+            &mut out,
+            &[1.0],
+            Sample {
+                real: 1.0,
+                imag: 0.0,
+                abs: 1.0,
+                arg: 0.0,
+                valid: true,
+            },
+        );
+        assert_eq!(out, "0.5,-2,,,,\n1,1,0,1,0\n");
+    }
+
+    #[test]
+    fn path_with_suffix_inserts_before_the_extension() {
+        assert_eq!(path_with_suffix("out.csv", "_im0"), "out_im0.csv");
+        assert_eq!(path_with_suffix("a/b.tar.csv", "_re0"), "a/b.tar_re0.csv");
+        assert_eq!(path_with_suffix("dir.v1/out", "_im0"), "dir.v1/out_im0");
+        assert_eq!(path_with_suffix(".hidden", "_im0"), ".hidden_im0");
+        assert_eq!(path_with_suffix("C:\\x\\y.csv", "_im0"), "C:\\x\\y_im0.csv");
+    }
+
+    #[test]
+    fn grid_csv_is_the_displayed_grid_and_axis_files_match_its_axis_rows() {
+        let (expr, plot) = csv_plot("1/x", square_domain(C::new(0.0, 0.0), 2.0), 5);
+        let grid = grid_csv(&plot);
+        let lines: Vec<&str> = grid.lines().collect();
+        assert_eq!(lines.len(), 26);
+        assert_eq!(lines[0], "arg-re,arg-im,val-re,val-im,val-abs,val-arg");
+        // Pole at the center: argument cells present, value cells empty.
+        assert_eq!(lines[1 + 2 * 5 + 2], "0,0,,,,");
+        // Row-major: first row is im = -2, re from -2 to 2; 1/(2-2i) = 0.25+0.25i.
+        let corner = csv_fields(lines[1 + 4]);
+        assert_eq!(&corner[..2], &[2.0, -2.0]);
+        assert_close(C::new(corner[2], corner[3]), C::new(0.25, 0.25), 1e-15);
+        assert!((corner[4] - 0.125f64.sqrt()).abs() < 1e-15);
+        assert!((corner[5] - std::f64::consts::FRAC_PI_4).abs() < 1e-15);
+        for (index, sample) in plot.samples.iter().enumerate() {
+            let fields = csv_fields(lines[1 + index]);
+            assert_eq!(fields[0], lerp_f64(-2.0, 2.0, (index % 5) as f64 / 4.0));
+            assert_eq!(fields[1], lerp_f64(-2.0, 2.0, (index / 5) as f64 / 4.0));
+            if sample.valid {
+                assert_eq!(&fields[2..], &[sample.real, sample.imag, sample.abs, sample.arg]);
+            }
+        }
+
+        let f = Function::plain(&expr);
+        let real_axis = axis_csv(f, &plot, Axis::Real);
+        let imag_axis = axis_csv(f, &plot, Axis::Imag);
+        assert_eq!(real_axis.lines().next(), Some("arg-re,val-re,val-im,val-abs,val-arg"));
+        assert_eq!(imag_axis.lines().next(), Some("arg-im,val-re,val-im,val-abs,val-arg"));
+        // The grid lands on both axes here, so the axis files are exactly those grid rows.
+        let strip = |line: &str, column: usize| {
+            let mut fields: Vec<&str> = line.split(',').collect();
+            fields.remove(column);
+            fields.join(",")
+        };
+        let expected_real: Vec<String> = lines[1..].iter().filter(|l| l.split(',').nth(1) == Some("0")).map(|l| strip(l, 1)).collect();
+        let expected_imag: Vec<String> = lines[1..].iter().filter(|l| l.split(',').next() == Some("0")).map(|l| strip(l, 0)).collect();
+        assert_eq!(real_axis.lines().skip(1).collect::<Vec<_>>(), expected_real);
+        assert_eq!(imag_axis.lines().skip(1).collect::<Vec<_>>(), expected_imag);
+        assert_eq!(expected_real.len(), 5);
+    }
+
+    #[test]
+    fn axis_csv_is_computed_when_the_grid_misses_the_axes() {
+        let (expr, plot) = csv_plot("x*x", square_domain(C::new(0.0, 0.0), 1.0), 4);
+        let f = Function::plain(&expr);
+        let real_axis = axis_csv(f, &plot, Axis::Real);
+        let imag_axis = axis_csv(f, &plot, Axis::Imag);
+        let real_rows: Vec<Vec<f64>> = real_axis.lines().skip(1).map(csv_fields).collect();
+        let imag_rows: Vec<Vec<f64>> = imag_axis.lines().skip(1).map(csv_fields).collect();
+        assert_eq!(real_rows.len(), 4);
+        assert_eq!(imag_rows.len(), 4);
+        for (i, (real, imag)) in real_rows.iter().zip(&imag_rows).enumerate() {
+            let x = lerp_f64(-1.0, 1.0, i as f64 / 3.0);
+            assert_ne!(x, 0.0);
+            assert_eq!(real[0], x);
+            assert_eq!(imag[0], x);
+            assert!((real[1] - x * x).abs() < 1e-15 && real[2].abs() < 1e-15);
+            assert!((imag[1] + x * x).abs() < 1e-15 && imag[2].abs() < 1e-15);
+            assert!((real[3] - x * x).abs() < 1e-15 && (imag[3] - x * x).abs() < 1e-15);
+        }
+    }
+
+    #[test]
+    fn axis_csv_uses_the_plotted_derivative() {
+        let (expr, plot) = csv_plot("x*x", square_domain(C::new(0.0, 0.0), 1.0), 3);
+        let plot = PlotData { deriv_order: 1, ..plot };
+        let real_axis = axis_csv(Function::plain(&expr), &plot, Axis::Real);
+        let rows: Vec<Vec<f64>> = real_axis.lines().skip(1).map(csv_fields).collect();
+        for (row, x) in rows.iter().zip([-1.0, 0.0, 1.0]) {
+            assert!((row[1] - 2.0 * x).abs() < 1e-6, "f'({x}) = {}", row[1]);
+        }
     }
 }
