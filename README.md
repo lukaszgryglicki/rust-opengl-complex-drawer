@@ -244,7 +244,20 @@ The iso-line count can be adjusted from `1` to `255`.
 
 ## Expression grammar
 
-Supported operators: `+`, `-`, `*`, `/`, `^`, parentheses, comma-separated function calls, unary signs, and implicit multiplication such as `2x`, `2sin(x)`, `(x+1)(x-1)`.
+Supported operators: `+`, `-`, `*`, `/`, `^`, `^^`, parentheses, comma-separated function calls, unary signs, and implicit multiplication such as `2x`, `2sin(x)`, `(x+1)(x-1)`.
+
+`base^^height` runs PATH's external `tet -q 10 base_re base_im height_re height_im`;
+no tetration algorithm is implemented here. `^^` binds more tightly than `^`,
+and both associate right before unary signs: `a^^b^^c` is `a^^(b^^c)`,
+`a^^b^c` is `(a^^b)^c`, and `-x^^2` is `-(x^^2)`. Both operands can be expressions,
+for example `x^^x-x^x+x` or `(1.333-0.06i)^^sin(x)`.
+
+Grid sampling uses the existing CPU workers, with at most one `tet` process per
+worker and `RAYON_NUM_THREADS=1` per child. Failed or nonfinite results become invalid
+values/holes; the first three errors are reported in the terminal. Expressions
+without `^^` do not require `tet`. Tetration, especially with numerical derivatives
+or fractional iteration, can be slow; camera rotation and recoloring reuse the
+calculated data.
 
 Variable: `x` or `z`, both interpreted as the complex argument.
 

@@ -1,3 +1,5 @@
+mod tetration;
+
 use macroquad::camera::Camera;
 use macroquad::prelude::*;
 use num_complex::{Complex64, ComplexFloat};
@@ -698,10 +700,13 @@ fn print_usage() {
     eprintln!("                     numerical regular iteration at a fixed point of f (slow); T=1 is plain f");
     eprintln!("  -h, --help         show this help");
     eprintln!("  --                 end of options (needed only for expressions starting with \"--\")");
+    eprintln!("  ^^ is tetration via PATH's tet -q 10 base_re base_im height_re height_im.");
+    eprintln!("  ^^ binds tighter than ^; both associate right, before unary signs.");
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  complex_surface_viewer \"exp(x)-ln(x)\" -2 2 -2 2");
     eprintln!("  complex_surface_viewer \"sin(x)/x\"");
+    eprintln!("  complex_surface_viewer \"x^^x-x^x+x\" 1.25 1.5 -0.125 -0.0625");
     eprintln!("  complex_surface_viewer \"gamma(x)\" -4.5 4.5 -2.5 2.5");
     eprintln!("  complex_surface_viewer --color=4d --show=re \"x^2\"");
     eprintln!("  complex_surface_viewer --color=4d --show=abs --colormap=\"3,(0,0,0),(1,0,0),(1,1,1)\" \"1/x\"");
@@ -3158,6 +3163,7 @@ impl Expr {
                     BinaryOp::Mul => a * b,
                     BinaryOp::Div => a / b,
                     BinaryOp::Pow => a.powc(b),
+                    BinaryOp::Tet => tetration::evaluate(a, b),
                 }
             }
             Expr::Func(name, args) => eval_function(name, args, x),
@@ -3350,6 +3356,7 @@ enum BinaryOp {
     Mul,
     Div,
     Pow,
+    Tet,
 }
 
 #[derive(Clone, Debug)]
@@ -3367,6 +3374,7 @@ enum TokenKind {
     Star,
     Slash,
     Caret,
+    Tet,
     LParen,
     RParen,
     Comma,
@@ -3454,19 +3462,30 @@ impl Parser {
                 self.bump();
                 Ok(Expr::Unary(UnaryOp::Minus, Box::new(self.parse_unary()?)))
             }
-            _ => self.parse_power(),
+            _ => self.parse_power(0),
         }
     }
 
-    fn parse_power(&mut self) -> Result<Expr, String> {
-        let base = self.parse_primary()?;
-        if matches!(self.current(), TokenKind::Caret) {
+    fn parse_power(&mut self, min_precedence: u8) -> Result<Expr, String> {
+        let mut base = self.parse_primary()?;
+        loop {
+            let (op, precedence) = match self.current() {
+                TokenKind::Caret => (BinaryOp::Pow, 1),
+                TokenKind::Tet => (BinaryOp::Tet, 2),
+                _ => break,
+            };
+            if precedence < min_precedence {
+                break;
+            }
             self.bump();
-            let exponent = self.parse_unary()?;
-            Ok(Expr::Binary(BinaryOp::Pow, Box::new(base), Box::new(exponent)))
-        } else {
-            Ok(base)
+            let exponent = if matches!(self.current(), TokenKind::Plus | TokenKind::Minus) {
+                self.parse_unary()?
+            } else {
+                self.parse_power(precedence)?
+            };
+            base = Expr::Binary(op, Box::new(base), Box::new(exponent));
         }
+        Ok(base)
     }
 
     fn parse_primary(&mut self) -> Result<Expr, String> {
@@ -3582,7 +3601,12 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
             }
             '^' => {
                 i += 1;
-                TokenKind::Caret
+                if i < chars.len() && chars[i].1 == '^' {
+                    i += 1;
+                    TokenKind::Tet
+                } else {
+                    TokenKind::Caret
+                }
             }
             '(' => {
                 i += 1;
@@ -3877,6 +3901,170 @@ mod tests {
         assert!(Parser::parse("bogus").is_err());
         assert!(Parser::parse("(x").is_err());
         assert!(Parser::parse("x)").is_err());
+        for input in ["x^^", "^^x", "2^^^3", "2^ ^3"] {
+            assert!(Parser::parse(input).is_err(), "{input}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tetration_uses_quiet_external_protocol() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::PathBuf;
+        use std::process::Command;
+
+        const FIXTURE: &str = "COMPLEX_DRAWER_TET_TEST_DIR";
+        let directory = match env::var_os(FIXTURE) {
+            Some(path) => PathBuf::from(path),
+            None => {
+                struct FixtureDirectory(PathBuf);
+                impl Drop for FixtureDirectory {
+                    fn drop(&mut self) {
+                        let _ = std::fs::remove_dir_all(&self.0);
+                    }
+                }
+                let directory = FixtureDirectory(env::temp_dir().join(format!(
+                    "complex-drawer-tet-{}-{}",
+                    std::process::id(),
+                    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+                )));
+                std::fs::create_dir(&directory.0).unwrap();
+                let program = directory.0.join("tet");
+                std::fs::write(
+                    &program,
+                    r#"#!/bin/sh
+if [ "$#" -ne 6 ] || [ "$1" != -q ] || [ "$2" != 10 ] ||
+   [ "$SILENT" != 1 ] || [ "$RAYON_NUM_THREADS" != 1 ]; then
+    echo 'incorrect invocation' >&2
+    exit 2
+fi
+printf '%s %s %s %s\n' "$3" "$4" "$5" "$6" >> "$0.calls"
+case "$3" in
+    9001) printf '4\n5\n'; echo 'unsupported input' >&2; exit 1 ;;
+    9002) printf 'NaN\n0\n' ;;
+    9003) printf '4\n5\nextra\n' ;;
+    *) printf '4\n5\n' ;;
+esac
+"#,
+                )
+                .unwrap();
+                std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+                let path = env::join_paths(
+                    std::iter::once(directory.0.clone())
+                        .chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
+                )
+                .unwrap();
+                let output = Command::new(env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::tetration_uses_quiet_external_protocol",
+                        "--nocapture",
+                    ])
+                    .env(FIXTURE, &directory.0)
+                    .env("PATH", path)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return;
+            }
+        };
+        let calls_path = directory.join("tet.calls");
+        let read_calls = || {
+            std::fs::read_to_string(&calls_path)
+                .unwrap()
+                .lines()
+                .map(|line| {
+                    let numbers: Vec<f64> = line
+                        .split_whitespace()
+                        .map(|part| part.parse().unwrap())
+                        .collect();
+                    assert_eq!(numbers.len(), 4);
+                    (
+                        C::new(numbers[0], numbers[1]),
+                        C::new(numbers[2], numbers[3]),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let x = C::new(1.3, -0.2);
+        let result = C::new(4.0, 5.0);
+        let real = |value| C::new(value, 0.0);
+        for (source, expected, arguments) in [
+            ("x^^x-x^x+x", result - x.powc(x) + x, vec![(x, x)]),
+            ("sin(x^^x)+x", result.sin() + x, vec![(x, x)]),
+            ("2^^3^2", result * result, vec![(real(2.0), real(3.0))]),
+            (
+                "2^3^^2",
+                real(2.0).powc(result),
+                vec![(real(3.0), real(2.0))],
+            ),
+            (
+                "2^^3^^2",
+                result,
+                vec![(real(3.0), real(2.0)), (real(2.0), result)],
+            ),
+            ("-2^^2", -result, vec![(real(2.0), real(2.0))]),
+            ("(-2)^^2", result, vec![(real(-2.0), real(2.0))]),
+            ("2^^-3^2", result, vec![(real(2.0), real(-9.0))]),
+            ("(2^3)^^2", result, vec![(real(8.0), real(2.0))]),
+            ("2^^(3^2)", result, vec![(real(2.0), real(9.0))]),
+            (
+                "x^^x+x^^(x+1)",
+                result * 2.0,
+                vec![(x, x), (x, x + real(1.0))],
+            ),
+            (
+                "(x+1+2i)^^(2*x-i)",
+                result,
+                vec![(x + C::new(1.0, 2.0), 2.0 * x - C::new(0.0, 1.0))],
+            ),
+        ] {
+            std::fs::write(&calls_path, "").unwrap();
+            assert_close(eval_str(source, x), expected, 1e-10);
+            let actual = read_calls();
+            assert_eq!(actual.len(), arguments.len(), "{source}");
+            for ((base, height), (expected_base, expected_height)) in
+                actual.into_iter().zip(arguments)
+            {
+                assert_close(base, expected_base, 1e-10);
+                assert_close(height, expected_height, 1e-10);
+            }
+        }
+
+        std::fs::write(&calls_path, "").unwrap();
+        assert_close(eval_str("sin(x)+x^2", x), x.sin() + x * x, 1e-12);
+        for source in ["inf^^x", "x^^nan"] {
+            assert!(!is_finite_c(eval_str(source, x)));
+        }
+        assert!(read_calls().is_empty());
+        for source in ["9001^^x", "9002^^x", "9003^^x"] {
+            assert!(!is_finite_c(eval_str(source, x)), "{source}");
+        }
+
+        std::fs::write(&calls_path, "").unwrap();
+        let domain = square_domain(C::new(1.25, -0.125), 0.125);
+        let (_, plot) = csv_plot("x^^x-x^x+x", domain, 5);
+        assert_eq!(plot.finite_sample_count, 25);
+        assert_eq!(read_calls().len(), 26);
+        for (index, sample) in plot.samples.iter().enumerate() {
+            let z = C::new(
+                lerp_f64(domain.re.min, domain.re.max, (index % 5) as f64 / 4.0),
+                lerp_f64(domain.im.min, domain.im.max, (index / 5) as f64 / 4.0),
+            );
+            assert_close(
+                C::new(sample.real, sample.imag),
+                result - z.powc(z) + z,
+                1e-10,
+            );
+        }
+        let before = read_calls().len();
+        assert_eq!(grid_csv(&plot).lines().count(), 26);
+        assert_eq!(read_calls().len(), before);
     }
 
     #[test]
