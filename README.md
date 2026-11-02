@@ -186,6 +186,18 @@ Example: a simple black -> red -> white ramp
 cargo run --release -- --color=4d --show=abs --colormap="3,(0,0,0),(1,0,0),(1,1,1)" "1/x"
 ```
 
+## Reusing calculated values
+
+Each sampled grid keeps all four components (real, imaginary, magnitude and phase),
+their ranges and the center probe, even for hidden surfaces. `1`-`5`, `G`, `I`,
+`U`/`O` and the other display/color/camera controls reuse these values; they only
+update the presentation, never reevaluate the function or launch `tet`.
+
+The cache holds at most the three derivative views (`f`, `f'`, `f''`) for the current
+domain and sample count. `V` computes a view on its first use and reuses it thereafter.
+Changing the domain or resolution discards those snapshots and samples the new grid.
+Derivatives and CSV axes are not calculated eagerly during startup.
+
 ## CSV export
 
 `Y` (or `--csv=FILE`) writes three comma-separated files with a header row,
@@ -197,10 +209,12 @@ others as series):
 - `..._im0.csv` — values along the real axis (`im = 0`): `arg-re,val-re,val-im,val-abs,val-arg`
 - `..._re0.csv` — values along the imaginary axis (`re = 0`): `arg-im,val-re,val-im,val-abs,val-arg`
 
-The axis lines are computed when saving at the grid's sample count over the
-current `re` / `im` range with the same derivative order and `--iter` setting,
-so they are exact even when the grid does not land on `im = 0` / `re = 0`
-(and identical to the grid rows when it does). Values are the raw function
+The axis lines reuse matching grid rows/columns when available; otherwise they
+are computed on the first save at the grid's sample count over the current
+`re` / `im` range with the same derivative order and `--iter` setting. Axis data
+is cached with that derivative view, so repeated saves do not reevaluate it.
+The lines remain exact even when the grid does not land on `im = 0` / `re = 0`.
+Values are the raw function
 values (the `G` vertical scale does not apply); `val-arg` is in radians, and
 poles / invalid samples leave the value cells empty. Numbers use `.` as the
 decimal separator - pick an English locale in the import dialog if yours uses `,`.
@@ -257,7 +271,7 @@ worker and `RAYON_NUM_THREADS=1` per child. Failed or nonfinite results become i
 values/holes; the first three errors are reported in the terminal. Expressions
 without `^^` do not require `tet`. Tetration, especially with numerical derivatives
 or fractional iteration, can be slow; camera rotation and recoloring reuse the
-calculated data.
+calculated data, as do visibility, scale and contour changes.
 
 Variable: `x` or `z`, both interpreted as the complex argument.
 

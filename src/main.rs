@@ -3,7 +3,9 @@ mod tetration;
 use macroquad::camera::Camera;
 use macroquad::prelude::*;
 use num_complex::{Complex64, ComplexFloat};
+use std::cell::OnceCell;
 use std::env;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -278,42 +280,7 @@ async fn run_viewer(cli: Cli, expr: Expr, iterate: Option<Iterate>) {
     let mut screenshot_path = cli.screenshot.clone();
     let mut csv_path = cli.csv.clone();
     let mut frame_index: u32 = 0;
-    let mut state = AppState {
-        function_text: cli.function.clone(),
-        expr,
-        iterate,
-        domain: Domain {
-            re: cli.re,
-            im: cli.im,
-        },
-        initial_domain: Domain {
-            re: cli.re,
-            im: cli.im,
-        },
-        plot: None,
-        samples_per_axis: DEFAULT_SAMPLES_PER_AXIS,
-        show_real: cli.visibility.show_real,
-        show_imag: cli.visibility.show_imag,
-        show_abs: cli.visibility.show_abs,
-        show_arg: cli.visibility.show_arg,
-        color_mode: cli.color_mode,
-        colormap: cli.colormap.clone(),
-        hue_anim: false,
-        hue_offset: 0.0,
-        deriv_order: 0,
-        y_scale: YScale::Linear,
-        transparent_surfaces: false,
-        wireframe_mode: false,
-        iso_lines_enabled: false,
-        iso_line_count: DEFAULT_ISO_LINE_COUNT,
-        fullscreen: false,
-        yaw: 0.75,
-        pitch: 0.52,
-        roll: 0.0,
-        auto_rotate: true,
-        show_help: true,
-        status: String::new(),
-    };
+    let mut state = AppState::new(&cli, expr, iterate);
 
     state.rebuild_plot();
 
@@ -507,8 +474,8 @@ async fn run_viewer(cli: Cli, expr: Expr, iterate: Option<Iterate>) {
                         draw_iso_line_segments(&plot.surface(kind).iso_lines, kind, shading, false);
                     } else {
                         draw_wireframe_surface(
-                            &plot.samples,
-                            plot.samples_per_axis,
+                            &plot.data.samples,
+                            plot.data.samples_per_axis,
                             state.domain,
                             plot.y,
                             kind,
@@ -580,7 +547,7 @@ fn save_screenshot(path: &str) {
 }
 
 /// Writes the displayed grid to `grid_path` and the values along the real axis (im = 0)
-/// and the imaginary axis (re = 0), computed now at the grid resolution, to
+/// and the imaginary axis (re = 0), cached at the grid resolution, to
 /// `<grid_path>_im0.csv` / `<grid_path>_re0.csv`. Returns the status line.
 fn save_csv_files(state: &AppState, grid_path: &str) -> Result<String, String> {
     let plot = state.plot.as_ref().ok_or("nothing plotted yet")?;
@@ -612,12 +579,21 @@ enum Axis {
 
 /// The displayed grid, one row per sample in grid order (im rows, re within a row).
 fn grid_csv(plot: &PlotData) -> String {
-    let n = plot.samples_per_axis;
+    let data = &plot.data;
+    let n = data.samples_per_axis;
     let steps = n - 1;
     let mut out = format!("arg-re,arg-im,{CSV_VALUE_HEADER}\n");
-    for (index, sample) in plot.samples.iter().enumerate() {
-        let re = lerp_f64(plot.domain.re.min, plot.domain.re.max, (index % n) as f64 / steps as f64);
-        let im = lerp_f64(plot.domain.im.min, plot.domain.im.max, (index / n) as f64 / steps as f64);
+    for (index, sample) in data.samples.iter().enumerate() {
+        let re = lerp_f64(
+            data.domain.re.min,
+            data.domain.re.max,
+            (index % n) as f64 / steps as f64,
+        );
+        let im = lerp_f64(
+            data.domain.im.min,
+            data.domain.im.max,
+            (index / n) as f64 / steps as f64,
+        );
         csv_row(&mut out, &[re, im], *sample);
     }
     out
@@ -626,23 +602,39 @@ fn grid_csv(plot: &PlotData) -> String {
 /// Values of the plotted function along one coordinate axis over the plot's range of
 /// that axis, sampled like the grid (same count, derivative order and step).
 fn axis_csv(f: Function, plot: &PlotData, axis: Axis) -> String {
-    let n = plot.samples_per_axis;
-    let steps = n - 1;
-    let h = deriv_step(plot.domain, plot.deriv_order);
-    let (range, header) = match axis {
-        Axis::Real => (plot.domain.re, "arg-re"),
-        Axis::Imag => (plot.domain.im, "arg-im"),
+    let data = &plot.data;
+    let (range, cross_range, header, index) = match axis {
+        Axis::Real => (data.domain.re, data.domain.im, "arg-re", 0),
+        Axis::Imag => (data.domain.im, data.domain.re, "arg-im", 1),
     };
-    let mut out = format!("{header},{CSV_VALUE_HEADER}\n");
-    for i in 0..n {
-        let x = lerp_f64(range.min, range.max, i as f64 / steps as f64);
-        let z = match axis {
-            Axis::Real => C::new(x, 0.0),
-            Axis::Imag => C::new(0.0, x),
-        };
-        csv_row(&mut out, &[x], sample_at(f, z, plot.deriv_order, h));
-    }
-    out
+    data.axis_csv[index]
+        .get_or_init(|| {
+            let n = data.samples_per_axis;
+            let steps = n - 1;
+            let h = deriv_step(data.domain, data.deriv_order);
+            let grid_axis = (0..n).find(|&i| {
+                lerp_f64(cross_range.min, cross_range.max, i as f64 / steps as f64) == 0.0
+            });
+            let mut out = format!("{header},{CSV_VALUE_HEADER}\n");
+            for i in 0..n {
+                let x = lerp_f64(range.min, range.max, i as f64 / steps as f64);
+                let sample = if let Some(cross) = grid_axis {
+                    data.samples[match axis {
+                        Axis::Real => cross * n + i,
+                        Axis::Imag => i * n + cross,
+                    }]
+                } else {
+                    let z = match axis {
+                        Axis::Real => C::new(x, 0.0),
+                        Axis::Imag => C::new(0.0, x),
+                    };
+                    sample_at(f, z, data.deriv_order, h)
+                };
+                csv_row(&mut out, &[x], sample);
+            }
+            out
+        })
+        .clone()
 }
 
 /// Argument columns followed by re, im, |f|, arg(f); non-finite values become empty cells.
@@ -804,7 +796,7 @@ struct Cli {
     iter: Option<C>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct Range {
     min: f64,
     max: f64,
@@ -858,7 +850,7 @@ impl Range {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct Domain {
     re: Range,
     im: Range,
@@ -937,6 +929,7 @@ struct AppState {
     domain: Domain,
     initial_domain: Domain,
     plot: Option<PlotData>,
+    sample_cache: [Option<Rc<PlotSamples>>; 3],
     samples_per_axis: usize,
     show_real: bool,
     show_imag: bool,
@@ -962,6 +955,46 @@ struct AppState {
 }
 
 impl AppState {
+    fn new(cli: &Cli, expr: Expr, iterate: Option<Iterate>) -> Self {
+        Self {
+            function_text: cli.function.clone(),
+            expr,
+            iterate,
+            domain: Domain {
+                re: cli.re,
+                im: cli.im,
+            },
+            initial_domain: Domain {
+                re: cli.re,
+                im: cli.im,
+            },
+            plot: None,
+            sample_cache: Default::default(),
+            samples_per_axis: DEFAULT_SAMPLES_PER_AXIS,
+            show_real: cli.visibility.show_real,
+            show_imag: cli.visibility.show_imag,
+            show_abs: cli.visibility.show_abs,
+            show_arg: cli.visibility.show_arg,
+            color_mode: cli.color_mode,
+            colormap: cli.colormap.clone(),
+            hue_anim: false,
+            hue_offset: 0.0,
+            deriv_order: 0,
+            y_scale: YScale::Linear,
+            transparent_surfaces: false,
+            wireframe_mode: false,
+            iso_lines_enabled: false,
+            iso_line_count: DEFAULT_ISO_LINE_COUNT,
+            fullscreen: false,
+            yaw: 0.75,
+            pitch: 0.52,
+            roll: 0.0,
+            auto_rotate: true,
+            show_help: true,
+            status: String::new(),
+        }
+    }
+
     fn shading(&self) -> Shading<'_> {
         Shading {
             mode: self.color_mode,
@@ -973,18 +1006,34 @@ impl AppState {
 
     fn rebuild_plot(&mut self) {
         let started = std::time::Instant::now();
+        if self.sample_cache.iter().flatten().any(|data| {
+            data.domain != self.domain || data.samples_per_axis != self.samples_per_axis
+        }) {
+            self.sample_cache = Default::default();
+        }
+        let order = self.deriv_order as usize;
+        let data = match &self.sample_cache[order] {
+            Some(data) => Rc::clone(data),
+            None => {
+                let data = sample_plot(
+                    Function {
+                        expr: &self.expr,
+                        iterate: self.iterate.as_ref(),
+                    },
+                    self.domain,
+                    self.samples_per_axis,
+                    self.deriv_order,
+                );
+                self.sample_cache[order] = Some(Rc::clone(&data));
+                data
+            }
+        };
         let plot = build_plot(
-            Function {
-                expr: &self.expr,
-                iterate: self.iterate.as_ref(),
-            },
-            self.domain,
-            self.samples_per_axis,
+            data,
             self.visibility(),
             self.shading(),
             self.iso_lines_enabled,
             self.iso_line_count,
-            self.deriv_order,
             self.y_scale,
         );
         if self.iterate.is_some() {
@@ -993,8 +1042,8 @@ impl AppState {
                 self.samples_per_axis,
                 self.samples_per_axis,
                 started.elapsed().as_secs_f64(),
-                plot.finite_sample_count,
-                plot.total_sample_count
+                plot.data.finite_sample_count,
+                plot.data.total_sample_count
             );
         }
         self.status = format!(
@@ -1007,8 +1056,8 @@ impl AppState {
             fmt_axis(self.y_scale.invert(plot.y.max)),
             self.samples_per_axis,
             self.samples_per_axis,
-            plot.finite_sample_count,
-            plot.total_sample_count,
+            plot.data.finite_sample_count,
+            plot.data.total_sample_count,
             on_off(self.iso_lines_enabled),
             self.iso_line_count,
             if self.show_real { "Re " } else { "" },
@@ -1117,6 +1166,10 @@ impl AppState {
 struct PlotData {
     surfaces: [SurfaceData; 4],
     y: Range,
+    data: Rc<PlotSamples>,
+}
+
+struct PlotSamples {
     finite_sample_count: usize,
     total_sample_count: usize,
     samples_per_axis: usize,
@@ -1125,6 +1178,8 @@ struct PlotData {
     deriv_order: u8,
     center_input: C,
     center_value: C,
+    raw_ranges: [Range; 4],
+    axis_csv: [OnceCell<String>; 2],
 }
 
 impl PlotData {
@@ -1424,46 +1479,74 @@ fn deriv_label(order: u8) -> &'static str {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_plot(
+fn sample_plot(
     f: Function,
     domain: Domain,
     samples_per_axis: usize,
-    visibility: SurfaceVisibility,
-    shading: Shading,
-    iso_lines_enabled: bool,
-    iso_line_count: usize,
     deriv_order: u8,
-    y_scale: YScale,
-) -> PlotData {
+) -> Rc<PlotSamples> {
     let n = samples_per_axis;
     assert!(n >= 2);
     let h = deriv_step(domain, deriv_order);
 
     let samples = sample_grid(f, domain, n, deriv_order, h);
-    let mut y_min = f64::INFINITY;
-    let mut y_max = f64::NEG_INFINITY;
-    let mut v_min = [f64::INFINITY; 4];
-    let mut v_max = [f64::NEG_INFINITY; 4];
+    let mut raw_ranges = [Range {
+        min: f64::INFINITY,
+        max: f64::NEG_INFINITY,
+    }; 4];
     let mut finite_sample_count = 0;
-    let mut visible_value_count = 0usize;
 
     for sample in samples.iter().filter(|sample| sample.valid) {
         finite_sample_count += 1;
         for kind in SurfaceKind::ALL {
-            let tv = y_scale.apply(kind.raw_value(*sample));
-            let k = kind.index();
-            v_min[k] = v_min[k].min(tv);
-            v_max[k] = v_max[k].max(tv);
-            if visibility.on(kind) {
-                y_min = y_min.min(tv);
-                y_max = y_max.max(tv);
-                visible_value_count += 1;
-            }
+            let value = kind.raw_value(*sample);
+            let range = &mut raw_ranges[kind.index()];
+            range.min = range.min.min(value);
+            range.max = range.max.max(value);
         }
     }
 
-    if visible_value_count == 0 || !y_min.is_finite() || !y_max.is_finite() {
+    let center_input = C::new(domain.re.mid(), domain.im.mid());
+    let center_value = eval_target(f, center_input, deriv_order, h);
+    Rc::new(PlotSamples {
+        finite_sample_count,
+        total_sample_count: n * n,
+        samples_per_axis: n,
+        samples,
+        domain,
+        deriv_order,
+        center_input,
+        center_value,
+        raw_ranges,
+        axis_csv: Default::default(),
+    })
+}
+
+fn build_plot(
+    data: Rc<PlotSamples>,
+    visibility: SurfaceVisibility,
+    shading: Shading,
+    iso_lines_enabled: bool,
+    iso_line_count: usize,
+    y_scale: YScale,
+) -> PlotData {
+    let n = data.samples_per_axis;
+    let domain = data.domain;
+    let ranges = data.raw_ranges.map(|range| Range {
+        min: y_scale.apply(range.min),
+        max: y_scale.apply(range.max),
+    });
+    let mut y_min = f64::INFINITY;
+    let mut y_max = f64::NEG_INFINITY;
+    for kind in SurfaceKind::ALL {
+        if visibility.on(kind) {
+            let range = ranges[kind.index()];
+            y_min = y_min.min(range.min);
+            y_max = y_max.max(range.max);
+        }
+    }
+
+    if !y_min.is_finite() || !y_max.is_finite() {
         y_min = -1.0;
         y_max = 1.0;
     }
@@ -1477,8 +1560,7 @@ fn build_plot(
 
     // Every surface's range is needed up front: in the `4d` color mode a surface
     // is colored by its partner component, normalized to the partner's range.
-    let value_ranges: [Option<Range>; 4] =
-        std::array::from_fn(|k| finite_range(v_min[k], v_max[k]));
+    let value_ranges = ranges.map(|range| finite_range(range.min, range.max));
 
     let mut surfaces: [SurfaceData; 4] = Default::default();
     for kind in SurfaceKind::ALL {
@@ -1491,7 +1573,7 @@ fn build_plot(
         };
         if visibility.on(kind) {
             let (meshes, vertex_infos) = build_surface_meshes(
-                &samples,
+                &data.samples,
                 n,
                 domain,
                 y,
@@ -1505,7 +1587,7 @@ fn build_plot(
             surface.vertex_infos = vertex_infos;
             if iso_lines_enabled {
                 surface.iso_lines = build_iso_value_lines(
-                    &samples,
+                    &data.samples,
                     n,
                     domain,
                     y,
@@ -1520,21 +1602,7 @@ fn build_plot(
         surfaces[k] = surface;
     }
 
-    let center_input = C::new(domain.re.mid(), domain.im.mid());
-    let center_value = eval_target(f, center_input, deriv_order, h);
-
-    PlotData {
-        surfaces,
-        y,
-        finite_sample_count,
-        total_sample_count: n * n,
-        samples_per_axis: n,
-        samples,
-        domain,
-        deriv_order,
-        center_input,
-        center_value,
-    }
+    PlotData { surfaces, y, data }
 }
 
 fn finite_range(min: f64, max: f64) -> Option<Range> {
@@ -1730,7 +1798,7 @@ fn recolor_plot(plot: &mut PlotData, shading: Shading) {
         let surface = &mut plot.surfaces[kind.index()];
         for (mesh, infos) in surface.meshes.iter_mut().zip(surface.vertex_infos.iter()) {
             for (vertex, info) in mesh.vertices.iter_mut().zip(infos.iter()) {
-                let s = plot.samples[info.sample as usize];
+                let s = plot.data.samples[info.sample as usize];
                 vertex.color = vertex_color(shading, kind, s, info.value01, info.color01).into();
             }
         }
@@ -2430,12 +2498,12 @@ fn draw_hud(state: &AppState) {
         y += line;
 
         let g = deriv_label(state.deriv_order);
-        let cv = plot.center_value;
+        let cv = plot.data.center_value;
         let probe = if cv.re.is_finite() && cv.im.is_finite() {
             format!(
                 "at center x = {} + {}i:  {} = {} + {}i   |{}| = {}   arg({}) = {}",
-                fmt_axis(plot.center_input.re),
-                fmt_axis(plot.center_input.im),
+                fmt_axis(plot.data.center_input.re),
+                fmt_axis(plot.data.center_input.im),
                 g,
                 fmt_axis(cv.re),
                 fmt_axis(cv.im),
@@ -2447,8 +2515,8 @@ fn draw_hud(state: &AppState) {
         } else {
             format!(
                 "at center x = {} + {}i:  {} is not finite",
-                fmt_axis(plot.center_input.re),
-                fmt_axis(plot.center_input.im),
+                fmt_axis(plot.data.center_input.re),
+                fmt_axis(plot.data.center_input.im),
                 g,
             )
         };
@@ -4048,10 +4116,10 @@ esac
 
         std::fs::write(&calls_path, "").unwrap();
         let domain = square_domain(C::new(1.25, -0.125), 0.125);
-        let (_, plot) = csv_plot("x^^x-x^x+x", domain, 5);
-        assert_eq!(plot.finite_sample_count, 25);
+        let (_, plot) = csv_plot("x^^x-x^x+x", domain, 5, 0);
+        assert_eq!(plot.data.finite_sample_count, 25);
         assert_eq!(read_calls().len(), 26);
-        for (index, sample) in plot.samples.iter().enumerate() {
+        for (index, sample) in plot.data.samples.iter().enumerate() {
             let z = C::new(
                 lerp_f64(domain.re.min, domain.re.max, (index % 5) as f64 / 4.0),
                 lerp_f64(domain.im.min, domain.im.max, (index / 5) as f64 / 4.0),
@@ -4065,6 +4133,179 @@ esac
         let before = read_calls().len();
         assert_eq!(grid_csv(&plot).lines().count(), 26);
         assert_eq!(read_calls().len(), before);
+
+        std::fs::write(&calls_path, "").unwrap();
+        let cli =
+            parse_cli(&["x^^x-x^x+x", "1.125", "1.375", "-0.625", "-0.375"].map(str::to_owned))
+                .unwrap();
+        let expr = Parser::parse(&cli.function).unwrap();
+        let mut state = AppState::new(&cli, expr, None);
+        state.samples_per_axis = 5;
+        state.rebuild_plot();
+        let before = read_calls().len();
+        let original_csv = grid_csv(state.plot.as_ref().unwrap());
+        state.show_real = !state.show_real;
+        state.rebuild_plot();
+        assert_eq!(
+            read_calls().len(),
+            before,
+            "changing visibility must not reevaluate the function"
+        );
+        assert_eq!(grid_csv(state.plot.as_ref().unwrap()), original_csv);
+
+        let data = Rc::clone(&state.plot.as_ref().unwrap().data);
+        for kind in SurfaceKind::ALL {
+            state.show_real = kind == SurfaceKind::Real;
+            state.show_imag = kind == SurfaceKind::Imag;
+            state.show_abs = kind == SurfaceKind::Abs;
+            state.show_arg = kind == SurfaceKind::Arg;
+            for scale in [YScale::Linear, YScale::Arsinh, YScale::Log10] {
+                state.y_scale = scale;
+                state.iso_lines_enabled = !state.iso_lines_enabled;
+                state.iso_line_count = 3;
+                state.rebuild_plot();
+                let plot = state.plot.as_ref().unwrap();
+                assert!(Rc::ptr_eq(&data, &plot.data));
+                assert_eq!(read_calls().len(), before);
+                assert_eq!(grid_csv(plot), original_csv);
+                let values = data
+                    .samples
+                    .iter()
+                    .map(|sample| scale.apply(kind.raw_value(*sample)));
+                let min = values.clone().fold(f64::INFINITY, f64::min);
+                let max = values.fold(f64::NEG_INFINITY, f64::max);
+                assert!((plot.y.min - min).abs() < 1e-12);
+                assert!((plot.y.max - max).abs() < 1e-12);
+                for surface in SurfaceKind::ALL {
+                    assert_eq!(plot.surface(surface).meshes.is_empty(), surface != kind);
+                }
+            }
+        }
+        state.show_arg = false;
+        state.rebuild_plot();
+        let plot = state.plot.as_ref().unwrap();
+        assert_eq!((plot.y.min, plot.y.max), (-1.0, 1.0));
+        assert_eq!(plot.data.finite_sample_count, 25);
+        state.show_real = true;
+        state.show_abs = true;
+        std::mem::swap(&mut state.show_real, &mut state.show_imag);
+        std::mem::swap(&mut state.show_abs, &mut state.show_arg);
+        state.change_iso_line_count(1);
+        state.rebuild_plot();
+        state.color_mode = ColorMode::FourD;
+        state.transparent_surfaces = true;
+        state.hue_offset = 0.25;
+        state.recolor();
+        assert_eq!(read_calls().len(), before);
+        assert_eq!(grid_csv(state.plot.as_ref().unwrap()), original_csv);
+
+        let axes = |state: &AppState| {
+            let f = Function {
+                expr: &state.expr,
+                iterate: state.iterate.as_ref(),
+            };
+            let plot = state.plot.as_ref().unwrap();
+            [axis_csv(f, plot, Axis::Real), axis_csv(f, plot, Axis::Imag)]
+        };
+        let original_axes = axes(&state);
+        let mut expected_calls = before + 10;
+        assert_eq!(read_calls().len(), expected_calls);
+        assert_eq!(axes(&state), original_axes);
+        assert_eq!(read_calls().len(), expected_calls);
+
+        for order in [1, 2] {
+            state.deriv_order = order;
+            state.rebuild_plot();
+            expected_calls += (order as usize + 1) * 26;
+            assert_eq!(read_calls().len(), expected_calls);
+            state.y_scale = state.y_scale.next();
+            state.rebuild_plot();
+            assert_eq!(read_calls().len(), expected_calls);
+        }
+        state.deriv_order = 0;
+        state.rebuild_plot();
+        assert_eq!(read_calls().len(), expected_calls);
+        assert_eq!(grid_csv(state.plot.as_ref().unwrap()), original_csv);
+        assert_eq!(axes(&state), original_axes);
+        assert_eq!(read_calls().len(), expected_calls);
+
+        state.domain.shift_re(0.1);
+        state.rebuild_plot();
+        expected_calls += 26;
+        assert_eq!(read_calls().len(), expected_calls);
+        assert_ne!(grid_csv(state.plot.as_ref().unwrap()), original_csv);
+        assert_ne!(axes(&state), original_axes);
+        expected_calls += 10;
+        assert_eq!(read_calls().len(), expected_calls);
+        state.deriv_order = 1;
+        state.rebuild_plot();
+        expected_calls += 52;
+        assert_eq!(read_calls().len(), expected_calls);
+
+        state.samples_per_axis = 6;
+        state.deriv_order = 0;
+        state.rebuild_plot();
+        expected_calls += 37;
+        assert_eq!(read_calls().len(), expected_calls);
+        assert_eq!(grid_csv(state.plot.as_ref().unwrap()).lines().count(), 37);
+        state.deriv_order = 1;
+        state.rebuild_plot();
+        expected_calls += 74;
+        assert_eq!(read_calls().len(), expected_calls);
+
+        state.domain = square_domain(C::new(0.0, 0.0), 1.0);
+        state.samples_per_axis = 5;
+        state.deriv_order = 0;
+        state.rebuild_plot();
+        expected_calls += 26;
+        let grid_axes = axes(&state);
+        assert!(grid_axes.iter().all(|csv| csv.lines().count() == 6));
+        assert_eq!(read_calls().len(), expected_calls);
+        assert_eq!(axes(&state), grid_axes);
+        assert_eq!(read_calls().len(), expected_calls);
+    }
+
+    #[test]
+    fn cached_ranges_preserve_constant_and_invalid_views() {
+        let domain = square_domain(C::new(0.0, 0.0), 1.0);
+        let colormap = ColorMap::default();
+        for source in ["4+5i", "1/0"] {
+            let expr = Parser::parse(source).unwrap();
+            let data = sample_plot(Function::plain(&expr), domain, 5, 0);
+            for kind in SurfaceKind::ALL {
+                let visibility = SurfaceVisibility {
+                    show_real: kind == SurfaceKind::Real,
+                    show_imag: kind == SurfaceKind::Imag,
+                    show_abs: kind == SurfaceKind::Abs,
+                    show_arg: kind == SurfaceKind::Arg,
+                };
+                for scale in [YScale::Linear, YScale::Arsinh, YScale::Log10] {
+                    let plot = build_plot(
+                        Rc::clone(&data),
+                        visibility,
+                        shading(ColorMode::FourD, false, &colormap),
+                        true,
+                        3,
+                        scale,
+                    );
+                    if source == "1/0" {
+                        assert_eq!((plot.y.min, plot.y.max), (-1.0, 1.0));
+                        assert_eq!(plot.data.finite_sample_count, 0);
+                        assert!(plot
+                            .surface(kind)
+                            .meshes
+                            .iter()
+                            .all(|mesh| mesh.indices.is_empty()));
+                    } else {
+                        let raw = [4.0, 5.0, 41f64.sqrt(), 5f64.atan2(4.0)][kind.index()];
+                        let value = scale.apply(raw);
+                        assert!((plot.y.min - (value - 1.0)).abs() < 1e-12);
+                        assert!((plot.y.max - (value + 1.0)).abs() < 1e-12);
+                        assert!(!plot.surface(kind).meshes.is_empty());
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -4306,13 +4547,10 @@ esac
         let colormap = ColorMap::parse("3,(0,0,0),(1,0,0),(1,1,1)").unwrap();
         let n = 9;
         let plot = build_plot(
-            Function::plain(&expr),
-            domain,
-            n,
+            sample_plot(Function::plain(&expr), domain, n, 0),
             visibility,
             shading(ColorMode::FourD, false, &colormap),
             false,
-            0,
             0,
             YScale::Linear,
         );
@@ -4342,7 +4580,7 @@ esac
             assert_eq!(vertex.color, expected);
         }
         // The vertex color of the `4d` mode depends only on the partner component.
-        let s = plot.samples[0];
+        let s = plot.data.samples[0];
         let a = vertex_color(shading(ColorMode::FourD, false, &colormap), SurfaceKind::Real, s, 0.1, 0.25);
         let b = vertex_color(shading(ColorMode::FourD, false, &colormap), SurfaceKind::Abs, s, 0.9, 0.25);
         assert_eq!(a.r, b.r);
@@ -4473,19 +4711,16 @@ esac
         // Odd sample count puts a sample exactly on the pole at 0.
         let colormap = ColorMap::default();
         let plot = build_plot(
-            Function::plain(&expr),
-            domain,
-            21,
+            sample_plot(Function::plain(&expr), domain, 21, 0),
             visibility,
             shading(ColorMode::Rings, false, &colormap),
             true,
             4,
-            0,
             YScale::Arsinh,
         );
-        assert_eq!(plot.total_sample_count, 441);
-        assert!(plot.finite_sample_count < plot.total_sample_count);
-        assert!(plot.finite_sample_count > 0);
+        assert_eq!(plot.data.total_sample_count, 441);
+        assert!(plot.data.finite_sample_count < plot.data.total_sample_count);
+        assert!(plot.data.finite_sample_count > 0);
         assert!(plot.y.min < plot.y.max);
         for kind in SurfaceKind::ALL {
             let surface = plot.surface(kind);
@@ -4516,14 +4751,11 @@ esac
         let colormap = ColorMap::default();
         let n = 9;
         let plot = build_plot(
-            Function::plain(&expr),
-            domain,
-            n,
+            sample_plot(Function::plain(&expr), domain, n, 0),
             visibility,
             shading(ColorMode::FourD, false, &colormap),
             true,
             4,
-            0,
             YScale::Linear,
         );
         let segments = &plot.surface(SurfaceKind::Real).iso_lines;
@@ -4690,18 +4922,23 @@ esac
         let colormap = ColorMap::default();
         let n = 7;
         let plot = build_plot(
-            Function { expr: &expr, iterate: Some(&twice) },
-            domain,
-            n,
+            sample_plot(
+                Function {
+                    expr: &expr,
+                    iterate: Some(&twice),
+                },
+                domain,
+                n,
+                0,
+            ),
             SurfaceVisibility::default(),
             shading(ColorMode::Solid, false, &colormap),
             false,
             0,
-            0,
             YScale::Linear,
         );
-        assert_eq!(plot.finite_sample_count, n * n);
-        for (idx, sample) in plot.samples.iter().enumerate() {
+        assert_eq!(plot.data.finite_sample_count, n * n);
+        for (idx, sample) in plot.data.samples.iter().enumerate() {
             let z = C::new(
                 lerp_f64(-1.0, 1.0, (idx % n) as f64 / (n - 1) as f64),
                 lerp_f64(-1.0, 1.0, (idx / n) as f64 / (n - 1) as f64),
@@ -4709,20 +4946,17 @@ esac
             let expected = z * z * z * z;
             assert_close(C::new(sample.real, sample.imag), expected, 1e-12);
         }
-        assert_close(plot.center_value, C::new(0.0, 0.0), 1e-15);
+        assert_close(plot.data.center_value, C::new(0.0, 0.0), 1e-15);
     }
 
-    fn csv_plot(function: &str, domain: Domain, n: usize) -> (Expr, PlotData) {
+    fn csv_plot(function: &str, domain: Domain, n: usize, deriv_order: u8) -> (Expr, PlotData) {
         let expr = Parser::parse(function).unwrap();
         let colormap = ColorMap::default();
         let plot = build_plot(
-            Function::plain(&expr),
-            domain,
-            n,
+            sample_plot(Function::plain(&expr), domain, n, deriv_order),
             SurfaceVisibility::default(),
             shading(ColorMode::Solid, false, &colormap),
             false,
-            0,
             0,
             YScale::Linear,
         );
@@ -4764,7 +4998,7 @@ esac
 
     #[test]
     fn grid_csv_is_the_displayed_grid_and_axis_files_match_its_axis_rows() {
-        let (expr, plot) = csv_plot("1/x", square_domain(C::new(0.0, 0.0), 2.0), 5);
+        let (expr, plot) = csv_plot("1/x", square_domain(C::new(0.0, 0.0), 2.0), 5, 0);
         let grid = grid_csv(&plot);
         let lines: Vec<&str> = grid.lines().collect();
         assert_eq!(lines.len(), 26);
@@ -4777,7 +5011,7 @@ esac
         assert_close(C::new(corner[2], corner[3]), C::new(0.25, 0.25), 1e-15);
         assert!((corner[4] - 0.125f64.sqrt()).abs() < 1e-15);
         assert!((corner[5] - std::f64::consts::FRAC_PI_4).abs() < 1e-15);
-        for (index, sample) in plot.samples.iter().enumerate() {
+        for (index, sample) in plot.data.samples.iter().enumerate() {
             let fields = csv_fields(lines[1 + index]);
             assert_eq!(fields[0], lerp_f64(-2.0, 2.0, (index % 5) as f64 / 4.0));
             assert_eq!(fields[1], lerp_f64(-2.0, 2.0, (index / 5) as f64 / 4.0));
@@ -4806,7 +5040,7 @@ esac
 
     #[test]
     fn axis_csv_is_computed_when_the_grid_misses_the_axes() {
-        let (expr, plot) = csv_plot("x*x", square_domain(C::new(0.0, 0.0), 1.0), 4);
+        let (expr, plot) = csv_plot("x*x", square_domain(C::new(0.0, 0.0), 1.0), 4, 0);
         let f = Function::plain(&expr);
         let real_axis = axis_csv(f, &plot, Axis::Real);
         let imag_axis = axis_csv(f, &plot, Axis::Imag);
@@ -4827,8 +5061,7 @@ esac
 
     #[test]
     fn axis_csv_uses_the_plotted_derivative() {
-        let (expr, plot) = csv_plot("x*x", square_domain(C::new(0.0, 0.0), 1.0), 3);
-        let plot = PlotData { deriv_order: 1, ..plot };
+        let (expr, plot) = csv_plot("x*x", square_domain(C::new(0.0, 0.0), 1.0), 3, 1);
         let real_axis = axis_csv(Function::plain(&expr), &plot, Axis::Real);
         let rows: Vec<Vec<f64>> = real_axis.lines().skip(1).map(csv_fields).collect();
         for (row, x) in rows.iter().zip([-1.0, 0.0, 1.0]) {
