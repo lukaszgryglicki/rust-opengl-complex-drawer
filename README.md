@@ -266,18 +266,26 @@ and both associate right before unary signs: `a^^b^^c` is `a^^(b^^c)`,
 `a^^b^c` is `(a^^b)^c`, and `-x^^2` is `-(x^^2)`. Both operands can be expressions,
 for example `x^^x-x^x+x` or `(1.333-0.06i)^^sin(x)`.
 
+The inverses of tetration solve `b^^h = z` through the same executable:
+`slog(b, z)` (alias `ate`) is the super-logarithm, the height `h`, and runs
+`tet -q --slog 10 b_re b_im z_re z_im`; `ssrt(z, h)` (alias `sroot`) is the
+super-root, the base `b`, and runs `tet -q --sroot 10 z_re z_im h_re h_im`.
+Both arguments can be expressions, for example `x^^x + ate(2+i, x) - ssrt(x, 1.5-i)`.
+
 Grid sampling uses the existing CPU workers, with at most one `tet` process per
 worker and `RAYON_NUM_THREADS=1` per child. Failed or nonfinite results become invalid
 values/holes; the first three errors are reported in the terminal. Expressions
-without `^^` do not require `tet`. Tetration, especially with numerical derivatives
-or fractional iteration, can be slow; camera rotation and recoloring reuse the
-calculated data, as do visibility, scale and contour changes.
+without `^^`, `slog` or `ssrt` do not require `tet`. Tetration, especially with
+numerical derivatives or fractional iteration, can be slow; camera rotation and
+recoloring reuse the calculated data, as do visibility, scale and contour changes.
+A super-root at a non-integer height can take seconds to minutes per sample, which
+adds up to hours on the initial 191x191 grid.
 
 Variable: `x` or `z`, both interpreted as the complex argument.
 
 Constants: `i`, `j`, `pi`, `π`, `tau`, `e`, `inf`, `nan`.
 
-Functions include: `abs`, `mag`, `mod`, `norm`, `abs2`, `mag2`, `norm_sqr`, `normsq`, `l1_norm`, `l1`, `manhattan`, `taxicab`, `arg`, `phase`, `to_polar`, `polar_r`, `radius`, `polar_theta`, `theta`, `re`, `real`, `im`, `imag`, `conj`, `conjugate`, `recip`, `inverse`, `inv`, `finv`, predicates such as `is_nan`, `is_infinite`, `is_finite`, `is_normal`, `sgn`, `sign`, `signum`, `cis`, `exp`, `exp2`, `expf`, `ln`, `log`, `log2`, `log10`, `sqrt`, `cbrt`, `sin`, `cos`, `tan`, inverse trig, hyperbolic functions, `sec`, `csc`, `cot`, `sech`, `csch`, `coth`, `gamma` (`tgamma`), `factorial` (`fact`), `pow`, `powc`, `powf`, `powi`, `powu`, `root`, `scale`, `unscale`, `fdiv`, `complex`, `rect`, `new`, `polar`, `from_polar`, and several component-wise rounding functions. Predicates return `1+0i` for true and `0+0i` for false.
+Functions include: `abs`, `mag`, `mod`, `norm`, `abs2`, `mag2`, `norm_sqr`, `normsq`, `l1_norm`, `l1`, `manhattan`, `taxicab`, `arg`, `phase`, `to_polar`, `polar_r`, `radius`, `polar_theta`, `theta`, `re`, `real`, `im`, `imag`, `conj`, `conjugate`, `recip`, `inverse`, `inv`, `finv`, predicates such as `is_nan`, `is_infinite`, `is_finite`, `is_normal`, `sgn`, `sign`, `signum`, `cis`, `exp`, `exp2`, `expf`, `ln`, `log`, `log2`, `log10`, `sqrt`, `cbrt`, `sin`, `cos`, `tan`, inverse trig, hyperbolic functions, `sec`, `csc`, `cot`, `sech`, `csch`, `coth`, `gamma` (`tgamma`), `factorial` (`fact`), `slog` (`ate`), `ssrt` (`sroot`), `pow`, `powc`, `powf`, `powi`, `powu`, `root`, `scale`, `unscale`, `fdiv`, `complex`, `rect`, `new`, `polar`, `from_polar`, and several component-wise rounding functions. Predicates return `1+0i` for true and `0+0i` for false.
 
 `gamma(x)` is the complex gamma function (Lanczos approximation with reflection
 for `Re(x) < 0.5`), and `factorial(x) = gamma(x+1)`. Try:

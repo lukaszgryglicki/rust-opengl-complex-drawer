@@ -694,6 +694,8 @@ fn print_usage() {
     eprintln!("  --                 end of options (needed only for expressions starting with \"--\")");
     eprintln!("  ^^ is tetration via PATH's tet -q 10 base_re base_im height_re height_im.");
     eprintln!("  ^^ binds tighter than ^; both associate right, before unary signs.");
+    eprintln!("  slog(b,z) (or ate) is the height h and ssrt(z,h) (or sroot) the base b in b^^h = z,");
+    eprintln!("  via tet -q --slog 10 b_re b_im z_re z_im and tet -q --sroot 10 z_re z_im h_re h_im.");
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  complex_surface_viewer \"exp(x)-ln(x)\" -2 2 -2 2");
@@ -3349,6 +3351,8 @@ fn eval_function(name: &str, args: &[Expr], x: C) -> C {
         "avg" => (args[0].eval(x) + args[1].eval(x)) / two,
         "gamma" | "tgamma" => complex_gamma(args[0].eval(x)),
         "factorial" | "fact" => complex_gamma(args[0].eval(x) + one),
+        "slog" | "ate" => tetration::super_log(args[0].eval(x), args[1].eval(x)),
+        "ssrt" | "sroot" => tetration::super_root(args[0].eval(x), args[1].eval(x)),
         _ => C::new(f64::NAN, f64::NAN), // unreachable after parser validation
     }
 }
@@ -3885,6 +3889,10 @@ fn is_function_name(name: &str) -> bool {
             | "tgamma"
             | "factorial"
             | "fact"
+            | "slog"
+            | "ate"
+            | "ssrt"
+            | "sroot"
     )
 }
 
@@ -3904,7 +3912,7 @@ fn validate_function(name: &str, arity: usize) -> Result<(), String> {
         | "factorial" | "fact" => arity == 1,
         "pow" | "powc" | "powf" | "powi" | "powu" | "root" | "scale" | "unscale"
         | "fdiv" | "complex" | "rect" | "new" | "polar" | "from_polar" | "minabs"
-        | "maxabs" | "avg" | "expf" => arity == 2,
+        | "maxabs" | "avg" | "expf" | "slog" | "ate" | "ssrt" | "sroot" => arity == 2,
         "log" => arity == 1 || arity == 2,
         _ => return Err(format!("unknown function `{name}`")),
     };
@@ -4001,6 +4009,16 @@ mod tests {
                 std::fs::write(
                     &program,
                     r#"#!/bin/sh
+case "$2" in --slog | --sroot)
+    if [ "$#" -ne 7 ] || [ "$1" != -q ] || [ "$3" != 10 ] ||
+       [ "$SILENT" != 1 ] || [ "$RAYON_NUM_THREADS" != 1 ]; then
+        echo 'incorrect invocation' >&2
+        exit 2
+    fi
+    printf '%s %s %s %s %s\n' "$2" "$4" "$5" "$6" "$7" >> "$0.inverse"
+    case "$2" in --slog) printf '6\n7\n' ;; *) printf '8\n9\n' ;; esac
+    exit ;;
+esac
 if [ "$#" -ne 6 ] || [ "$1" != -q ] || [ "$2" != 10 ] ||
    [ "$SILENT" != 1 ] || [ "$RAYON_NUM_THREADS" != 1 ]; then
     echo 'incorrect invocation' >&2
@@ -4102,6 +4120,24 @@ esac
                 assert_close(base, expected_base, 1e-10);
                 assert_close(height, expected_height, 1e-10);
             }
+        }
+
+        std::fs::write(&calls_path, "").unwrap();
+        let (slog, ssrt) = (C::new(6.0, 7.0), C::new(8.0, 9.0));
+        assert_close(
+            eval_str("x^^x + ate(2+i, x) - ssrt(x, 1.5-i)", x),
+            result + slog - ssrt,
+            1e-10,
+        );
+        assert_close(eval_str("SLOG(x, 2) sroot(3, x)", x), slog * ssrt, 1e-10);
+        assert_eq!(read_calls(), [(x, x)]);
+        assert_eq!(
+            std::fs::read_to_string(directory.join("tet.inverse")).unwrap(),
+            "--slog 2 1 1.3 -0.2\n--sroot 1.3 -0.2 1.5 -1\n\
+             --slog 1.3 -0.2 2 0\n--sroot 3 0 1.3 -0.2\n"
+        );
+        for source in ["slog(x)", "ate()", "ssrt(x, 2, 3)", "sroot"] {
+            assert!(Parser::parse(source).is_err(), "{source}");
         }
 
         std::fs::write(&calls_path, "").unwrap();

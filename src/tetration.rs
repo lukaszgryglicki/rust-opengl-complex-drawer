@@ -6,28 +6,50 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 static REPORTED_ERRORS: AtomicUsize = AtomicUsize::new(0);
 
 pub fn evaluate(base: Complex64, height: Complex64) -> Complex64 {
-    match evaluate_with(Path::new("tet"), base, height) {
+    solve(None, base, height)
+}
+
+/// The height `h` with `base^^h = value`.
+pub fn super_log(base: Complex64, value: Complex64) -> Complex64 {
+    solve(Some("--slog"), base, value)
+}
+
+/// The base `b` with `b^^height = value`.
+pub fn super_root(value: Complex64, height: Complex64) -> Complex64 {
+    solve(Some("--sroot"), value, height)
+}
+
+fn solve(mode: Option<&str>, a: Complex64, b: Complex64) -> Complex64 {
+    match evaluate_with(Path::new("tet"), mode, a, b) {
         Ok(value) => value,
         Err(err) => {
             if REPORTED_ERRORS.fetch_add(1, Ordering::Relaxed) < 3 {
-                eprintln!("tet({base}, {height}): {err}");
+                let mode = mode.map(|mode| format!(" {mode}")).unwrap_or_default();
+                eprintln!("tet{mode}({a}, {b}): {err}");
             }
             Complex64::new(f64::NAN, f64::NAN)
         }
     }
 }
 
-fn evaluate_with(program: &Path, base: Complex64, height: Complex64) -> Result<Complex64, String> {
-    if !base.is_finite() || !height.is_finite() {
+fn evaluate_with(
+    program: &Path,
+    mode: Option<&str>,
+    a: Complex64,
+    b: Complex64,
+) -> Result<Complex64, String> {
+    if !a.is_finite() || !b.is_finite() {
         return Err("tetration operands must be finite".to_owned());
     }
     let output = Command::new(program)
-        .args(["-q", "10"])
+        .arg("-q")
+        .args(mode)
+        .arg("10")
         .args([
-            base.re.to_string(),
-            base.im.to_string(),
-            height.re.to_string(),
-            height.im.to_string(),
+            a.re.to_string(),
+            a.im.to_string(),
+            b.re.to_string(),
+            b.im.to_string(),
         ])
         .env("SILENT", "1")
         .env("RAYON_NUM_THREADS", "1")
@@ -84,11 +106,11 @@ mod tests {
         let nonfinite = Complex64::new(f64::NAN, 0.0);
         for (base, height) in [(nonfinite, finite), (finite, nonfinite)] {
             assert_eq!(
-                evaluate_with(&program, base, height).unwrap_err(),
+                evaluate_with(&program, None, base, height).unwrap_err(),
                 "tetration operands must be finite"
             );
         }
-        assert!(evaluate_with(&program, finite, finite)
+        assert!(evaluate_with(&program, None, finite, finite)
             .unwrap_err()
             .contains("ensure tet is on PATH"));
     }
