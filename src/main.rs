@@ -3258,7 +3258,7 @@ impl Expr {
     }
 
     fn eval(&self, x: C) -> C {
-        match self {
+        let value = match self {
             Expr::Const(c) => *c,
             Expr::Var => x,
             Expr::Unary(op, arg) => match op {
@@ -3278,8 +3278,16 @@ impl Expr {
                 }
             }
             Expr::Func(name, args) => eval_function(name, args, x),
-        }
+        };
+        unsigned_zeros(value)
     }
+}
+
+/// A zero part has no sign, as in `tet`: `-4` is `-4 + 0i`, on the upper side of
+/// the branch cuts, so `sqrt(-4)` is `2i` and `ln(-1)` is `pi i`.
+fn unsigned_zeros(value: C) -> C {
+    let part = |part: f64| if part == 0.0 { 0.0 } else { part };
+    C::new(part(value.re), part(value.im))
 }
 
 fn eval_function(name: &str, args: &[Expr], x: C) -> C {
@@ -3392,6 +3400,7 @@ fn eval_function(name: &str, args: &[Expr], x: C) -> C {
         "avg" => (args[0].eval(x) + args[1].eval(x)) / two,
         "gamma" | "tgamma" => complex_gamma(args[0].eval(x)),
         "factorial" | "fact" => complex_gamma(args[0].eval(x) + one),
+        "tet" => tetration::evaluate(args[0].eval(x), args[1].eval(x)),
         "slog" | "ate" => tetration::super_log(args[0].eval(x), args[1].eval(x)),
         "ssrt" | "sroot" => tetration::super_root(args[0].eval(x), args[1].eval(x)),
         _ => C::new(f64::NAN, f64::NAN), // unreachable after parser validation
@@ -3977,6 +3986,7 @@ fn is_function_name(name: &str) -> bool {
             | "tgamma"
             | "factorial"
             | "fact"
+            | "tet"
             | "slog"
             | "ate"
             | "ssrt"
@@ -4000,7 +4010,7 @@ fn validate_function(name: &str, arity: usize) -> Result<(), String> {
         | "factorial" | "fact" => arity == 1,
         "pow" | "powc" | "powf" | "powi" | "powu" | "root" | "scale" | "unscale"
         | "fdiv" | "complex" | "rect" | "new" | "polar" | "from_polar" | "minabs"
-        | "maxabs" | "avg" | "expf" | "slog" | "ate" | "ssrt" | "sroot" => arity == 2,
+        | "maxabs" | "avg" | "expf" | "tet" | "slog" | "ate" | "ssrt" | "sroot" => arity == 2,
         "log" => arity == 1 || arity == 2,
         _ => return Err(format!("unknown function `{name}`")),
     };
