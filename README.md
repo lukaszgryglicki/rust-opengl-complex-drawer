@@ -285,6 +285,61 @@ Variable: `x` or `z`, both interpreted as the complex argument.
 
 Constants: `i`, `j`, `pi`, `π`, `tau`, `e`, `inf`, `nan`.
 
+Named real constants (`gamma` alone is the constant, `gamma(x)` is still the function):
+
+| Constant           | Aliases           | Value                  | Meaning                                                      |
+|--------------------|-------------------|------------------------|--------------------------------------------------------------|
+| `pi`               | `π`               | 3.141592653589793      | circle constant                                              |
+| `e`                |                   | 2.718281828459045      | Euler's number                                               |
+| `tau`              | `τ`               | 6.283185307179586      | 2 pi                                                         |
+| `phi`              | `φ`, `golden`     | 1.618033988749895      | golden ratio (1 + sqrt 5)/2                                  |
+| `gamma`            | `γ`, `eulergamma` | 0.5772156649015329     | Euler-Mascheroni constant                                    |
+| `catalan`          |                   | 0.915965594177219      | Catalan's constant                                           |
+| `apery`            | `zeta3`           | 1.2020569031595942     | Apery's constant zeta(3)                                     |
+| `zeta2`            | `basel`           | 1.6449340668482264     | zeta(2) = pi^2/6                                             |
+| `ln2`              |                   | 0.6931471805599453     | natural logarithm of 2                                       |
+| `ln10`             |                   | 2.302585092994046      | natural logarithm of 10                                      |
+| `sqrt2`            | `√2`              | 1.4142135623730951     | square root of 2                                             |
+| `sqrt3`            | `√3`              | 1.7320508075688772     | square root of 3                                             |
+| `sqrt5`            | `√5`              | 2.23606797749979       | square root of 5                                             |
+| `sqrtpi`           | `√π`              | 1.772453850905516      | square root of pi                                            |
+| `halfpi`           |                   | 1.5707963267948966     | pi/2                                                         |
+| `eta`              | `η`, `towermax`   | 1.444667861009766      | e^(1/e): the largest base whose infinite tower converges     |
+| `towermin`         |                   | 0.06598803584531254    | e^(-e): the smallest base whose infinite tower converges     |
+| `einv`             |                   | 0.36787944117144233    | 1/e                                                          |
+| `omega`            | `Ω`               | 0.5671432904097838     | omega constant W(1): omega e^omega = 1                       |
+| `dottie`           |                   | 0.7390851332151607     | Dottie number: cos x = x                                     |
+| `gelfond`          |                   | 23.14069263277927      | Gelfond's constant e^pi                                      |
+| `gelfondschneider` |                   | 2.665144142690225      | Gelfond-Schneider constant 2^sqrt(2)                         |
+| `ramanujan`        |                   | 2.6253741264076874e+17 | Ramanujan's constant e^(pi sqrt 163)                         |
+| `silver`           |                   | 2.414213562373095      | silver ratio 1 + sqrt 2                                      |
+| `plastic`          |                   | 1.324717957244746      | plastic number: x^3 = x + 1                                  |
+| `supergolden`      |                   | 1.465571231876768      | supergolden ratio: x^3 = x^2 + 1                             |
+| `tribonacci`       |                   | 1.8392867552141612     | tribonacci constant: x^3 = x^2 + x + 1                       |
+| `lemniscate`       | `ϖ`               | 2.6220575542921196     | lemniscate constant Gamma(1/4)^2/(2 sqrt(2 pi))              |
+| `gauss`            |                   | 0.8346268416740732     | Gauss's constant 1/agm(1, sqrt 2)                            |
+| `levy`             |                   | 3.2758229187218113     | Levy's constant e^(pi^2/(12 ln 2))                           |
+| `khinchin`         |                   | 2.6854520010653062     | Khinchin's constant                                          |
+| `erdosborwein`     |                   | 1.6066951524152917     | Erdos-Borwein constant: sum of 1/(2^n - 1)                   |
+| `cahen`            |                   | 0.643410546288338      | Cahen's constant                                             |
+| `recfib`           |                   | 3.3598856662431777     | reciprocal Fibonacci constant: sum of 1/F_n                  |
+| `gompertz`         |                   | 0.5963473623231941     | Euler-Gompertz constant                                      |
+| `soldner`          |                   | 1.451369234883381      | Ramanujan-Soldner constant: zero of the logarithmic integral |
+| `laplace`          |                   | 0.6627434193491816     | Laplace limit                                                |
+| `parabolic`        |                   | 2.295587149392638      | universal parabolic constant sqrt 2 + ln(1 + sqrt 2)         |
+| `deg`              | `degree`          | 0.017453292519943295   | one degree in radians, pi/180                                |
+| `niven`            |                   | 1.7052111401053678     | Niven's constant                                             |
+| `twinprime`        |                   | 0.6601618158468696     | twin prime constant                                          |
+| `mertens`          |                   | 0.26149721284764277    | Meissel-Mertens constant                                     |
+
+The domain arguments `re_min re_max im_min im_max` are numbers or constant expressions
+of this grammar without variables that evaluate to a finite real number, for example
+`-pi/2`, `2e`, `sqrt(2)+1`, `1.5^^2` or `pi*e^e-pow(2, 0.5)`:
+
+```bash
+cargo run --release -- "eta^x-x" 0 2e -pi/2 "sqrt(2)+1"
+```
+
 Functions include: `abs`, `mag`, `mod`, `norm`, `abs2`, `mag2`, `norm_sqr`, `normsq`, `l1_norm`, `l1`, `manhattan`, `taxicab`, `arg`, `phase`, `to_polar`, `polar_r`, `radius`, `polar_theta`, `theta`, `re`, `real`, `im`, `imag`, `conj`, `conjugate`, `recip`, `inverse`, `inv`, `finv`, predicates such as `is_nan`, `is_infinite`, `is_finite`, `is_normal`, `sgn`, `sign`, `signum`, `cis`, `exp`, `exp2`, `expf`, `ln`, `log`, `log2`, `log10`, `sqrt`, `cbrt`, `sin`, `cos`, `tan`, inverse trig, hyperbolic functions, `sec`, `csc`, `cot`, `sech`, `csch`, `coth`, `gamma` (`tgamma`), `factorial` (`fact`), `slog` (`ate`), `ssrt` (`sroot`), `pow`, `powc`, `powf`, `powi`, `powu`, `root`, `scale`, `unscale`, `fdiv`, `complex`, `rect`, `new`, `polar`, `from_polar`, and several component-wise rounding functions. Predicates return `1+0i` for true and `0+0i` for false.
 
 `gamma(x)` is the complex gamma function (Lanczos approximation with reflection

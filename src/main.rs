@@ -696,10 +696,19 @@ fn print_usage() {
     eprintln!("  ^^ binds tighter than ^; both associate right, before unary signs.");
     eprintln!("  slog(b,z) (or ate) is the height h and ssrt(z,h) (or sroot) the base b in b^^h = z,");
     eprintln!("  via tet -q --slog 10 b_re b_im z_re z_im and tet -q --sroot 10 z_re z_im h_re h_im.");
+    eprintln!("  Constants (aliases): pi (π), e, tau (τ), phi (φ, golden), gamma (γ, eulergamma), catalan,");
+    eprintln!("  apery (zeta3), zeta2 (basel), ln2, ln10, sqrt2 (√2), sqrt3 (√3), sqrt5 (√5), sqrtpi (√π),");
+    eprintln!("  halfpi, eta (η, towermax), towermin, einv, omega (Ω), dottie, gelfond, gelfondschneider,");
+    eprintln!("  ramanujan, silver, plastic, supergolden, tribonacci, lemniscate (ϖ), gauss, levy, khinchin,");
+    eprintln!("  erdosborwein, cahen, recfib, gompertz, soldner, laplace, parabolic, deg (degree), niven,");
+    eprintln!("  twinprime, mertens; README.md lists the values. gamma(x) is still the gamma function.");
+    eprintln!("  re_min re_max im_min im_max are numbers or real constant expressions without variables,");
+    eprintln!("  e.g. -pi/2, 2e, sqrt(2)+1, 1.5^^2.");
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  complex_surface_viewer \"exp(x)-ln(x)\" -2 2 -2 2");
     eprintln!("  complex_surface_viewer \"sin(x)/x\"");
+    eprintln!("  complex_surface_viewer \"eta^x-x\" 0 2e -pi/2 \"sqrt(2)+1\"");
     eprintln!("  complex_surface_viewer \"x^^x-x^x+x\" 1.25 1.5 -0.125 -0.0625");
     eprintln!("  complex_surface_viewer \"gamma(x)\" -4.5 4.5 -2.5 2.5");
     eprintln!("  complex_surface_viewer --color=4d --show=re \"x^2\"");
@@ -757,10 +766,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
     }
 
     let (re, im) = if positional.len() == 5 {
-        (
-            Range::new(parse_f64_arg(positional[1], "re_min")?, parse_f64_arg(positional[2], "re_max")?)?,
-            Range::new(parse_f64_arg(positional[3], "im_min")?, parse_f64_arg(positional[4], "im_max")?)?,
-        )
+        parse_domain_args(&positional[1..])?
     } else {
         (Range::new(-2.0, 2.0)?, Range::new(-2.0, 2.0)?)
     };
@@ -782,7 +788,33 @@ fn parse_f64_arg(s: &str, name: &str) -> Result<f64, String> {
     s.parse::<f64>()
         .ok()
         .filter(|v| v.is_finite())
-        .ok_or_else(|| format!("{name} must be a finite floating-point number, got '{s}'"))
+        .map_or_else(|| parse_real_constant(s), Ok)
+        .map_err(|err| format!("{name} must be a number or a constant expression without variables, got '{s}': {err}"))
+}
+
+/// The real and imaginary ranges of the domain from the four range arguments.
+fn parse_domain_args(args: &[&str]) -> Result<(Range, Range), String> {
+    let (re_min, re_max) = (parse_f64_arg(args[0], "re_min")?, parse_f64_arg(args[1], "re_max")?);
+    let (im_min, im_max) = (parse_f64_arg(args[2], "im_min")?, parse_f64_arg(args[3], "im_max")?);
+    let (real, imaginary) = (format!("[{re_min}, {re_max}]"), format!("[{im_min}, {im_max}]"));
+    let invalid = match (Range::new(re_min, re_max), Range::new(im_min, im_max)) {
+        (Ok(re), Ok(im)) => return Ok((re, im)),
+        (Err(_), Err(_)) if re_min >= re_max && im_min >= im_max => {
+            format!("real range {real} and imaginary range {imaginary}: each min must be smaller than its max")
+        }
+        (Err(_), _) if re_min >= re_max => format!("real range {real}: re_min must be smaller than re_max"),
+        (_, Err(_)) if im_min >= im_max => {
+            format!("imaginary range {imaginary}: im_min must be smaller than im_max")
+        }
+        (Err(err), _) => format!("real range {real}: {err}"),
+        (_, Err(err)) => format!("imaginary range {imaginary}: {err}"),
+    };
+    Err(format!(
+        "Invalid {invalid}\n\
+         Detected ranges: real {real} from '{}' '{}', imaginary {imaginary} from '{}' '{}'\n\
+         The range arguments are: re_min re_max im_min im_max",
+        args[0], args[1], args[2], args[3]
+    ))
 }
 
 #[derive(Clone)]
@@ -3192,6 +3224,15 @@ fn parse_complex_constant(text: &str) -> Result<C, String> {
     Ok(value)
 }
 
+/// Parses a constant real expression such as `pi/2`, `-2*e` or `sqrt(2)+1`.
+fn parse_real_constant(text: &str) -> Result<f64, String> {
+    let value = parse_complex_constant(text)?;
+    if value.im.abs() > 1e-12 * value.re.abs().max(1.0) {
+        return Err(format!("`{text}` = {} is not a real number", fmt_complex(value)));
+    }
+    Ok(value.re)
+}
+
 // -----------------------------
 // Expression parser and evaluator
 // -----------------------------
@@ -3755,7 +3796,7 @@ fn peek_is_digit(chars: &[(usize, char)], i: usize) -> bool {
 }
 
 fn is_ident_start(ch: char) -> bool {
-    ch == '_' || ch == 'π' || ch.is_alphabetic()
+    ch == '_' || ch == 'π' || ch == '√' || ch.is_alphabetic()
 }
 
 fn is_ident_continue(ch: char) -> bool {
@@ -3765,9 +3806,53 @@ fn is_ident_continue(ch: char) -> bool {
 fn normalize_ident(name: &str) -> String {
     match name {
         "π" => "pi".to_owned(),
+        "τ" => "tau".to_owned(),
         _ => name.to_ascii_lowercase(),
     }
 }
+
+// Named real constants besides `pi`, `tau` and `e`: (name and aliases, value).
+const NAMED_CONSTANTS: [(&[&str], f64); 39] = [
+    (&["phi", "φ", "golden"], 1.618033988749895),
+    (&["gamma", "γ", "eulergamma"], 0.5772156649015329),
+    (&["catalan"], 0.915965594177219),
+    (&["apery", "zeta3"], 1.2020569031595942),
+    (&["zeta2", "basel"], 1.6449340668482264),
+    (&["ln2"], std::f64::consts::LN_2),
+    (&["ln10"], std::f64::consts::LN_10),
+    (&["sqrt2", "√2"], std::f64::consts::SQRT_2),
+    (&["sqrt3", "√3"], 1.7320508075688772),
+    (&["sqrt5", "√5"], 2.23606797749979),
+    (&["sqrtpi", "√π"], 1.772453850905516),
+    (&["halfpi"], std::f64::consts::FRAC_PI_2),
+    (&["eta", "η", "towermax"], 1.444667861009766),
+    (&["towermin"], 0.06598803584531254),
+    (&["einv"], 0.36787944117144233),
+    (&["omega", "Ω"], 0.5671432904097838),
+    (&["dottie"], 0.7390851332151607),
+    (&["gelfond"], 23.14069263277927),
+    (&["gelfondschneider"], 2.665144142690225),
+    (&["ramanujan"], 2.6253741264076874e+17),
+    (&["silver"], 2.414213562373095),
+    (&["plastic"], 1.324717957244746),
+    (&["supergolden"], 1.465571231876768),
+    (&["tribonacci"], 1.8392867552141612),
+    (&["lemniscate", "ϖ"], 2.6220575542921196),
+    (&["gauss"], 0.8346268416740732),
+    (&["levy"], 3.2758229187218113),
+    (&["khinchin"], 2.6854520010653062),
+    (&["erdosborwein"], 1.6066951524152917),
+    (&["cahen"], 0.643410546288338),
+    (&["recfib"], 3.3598856662431777),
+    (&["gompertz"], 0.5963473623231941),
+    (&["soldner"], 1.451369234883381),
+    (&["laplace"], 0.6627434193491816),
+    (&["parabolic"], 2.295587149392638),
+    (&["deg", "degree"], 0.017453292519943295),
+    (&["niven"], 1.7052111401053678),
+    (&["twinprime"], 0.6601618158468696),
+    (&["mertens"], 0.26149721284764277),
+];
 
 fn constant_or_variable(name: &str) -> Option<Expr> {
     match name {
@@ -3778,7 +3863,10 @@ fn constant_or_variable(name: &str) -> Option<Expr> {
         "e" => Some(Expr::Const(C::new(std::f64::consts::E, 0.0))),
         "inf" | "infinity" => Some(Expr::Const(C::new(f64::INFINITY, 0.0))),
         "nan" => Some(Expr::Const(C::new(f64::NAN, 0.0))),
-        _ => None,
+        _ => NAMED_CONSTANTS
+            .iter()
+            .find(|(names, _)| names.contains(&name))
+            .map(|&(_, value)| Expr::Const(C::new(value, 0.0))),
     }
 }
 
@@ -3967,6 +4055,127 @@ mod tests {
         assert_close(eval_str("e", x), C::new(std::f64::consts::E, 0.0), 1e-12);
     }
 
+    // Every name and alias of the named constants, then the correctly rounded value.
+    const NAMED_CONSTANT_VALUES: &str = "pi π 3.141592653589793
+        e 2.718281828459045
+        tau τ 6.283185307179586
+        phi φ golden 1.618033988749895
+        gamma γ eulergamma 0.5772156649015329
+        catalan 0.915965594177219
+        apery zeta3 1.2020569031595942
+        zeta2 basel 1.6449340668482264
+        ln2 0.6931471805599453
+        ln10 2.302585092994046
+        sqrt2 √2 1.4142135623730951
+        sqrt3 √3 1.7320508075688772
+        sqrt5 √5 2.23606797749979
+        sqrtpi √π 1.772453850905516
+        halfpi 1.5707963267948966
+        eta η towermax 1.444667861009766
+        towermin 0.06598803584531254
+        einv 0.36787944117144233
+        omega Ω 0.5671432904097838
+        dottie 0.7390851332151607
+        gelfond 23.14069263277927
+        gelfondschneider 2.665144142690225
+        ramanujan 2.6253741264076874e+17
+        silver 2.414213562373095
+        plastic 1.324717957244746
+        supergolden 1.465571231876768
+        tribonacci 1.8392867552141612
+        lemniscate ϖ 2.6220575542921196
+        gauss 0.8346268416740732
+        levy 3.2758229187218113
+        khinchin 2.6854520010653062
+        erdosborwein 1.6066951524152917
+        cahen 0.643410546288338
+        recfib 3.3598856662431777
+        gompertz 0.5963473623231941
+        soldner 1.451369234883381
+        laplace 0.6627434193491816
+        parabolic 2.295587149392638
+        deg degree 0.017453292519943295
+        niven 1.7052111401053678
+        twinprime 0.6601618158468696
+        mertens 0.26149721284764277";
+
+    #[test]
+    fn named_constants_resolve_by_every_name_and_alias() {
+        let x = C::new(1.5, -0.5);
+        let mut names = 0;
+        for line in NAMED_CONSTANT_VALUES.lines() {
+            let mut words: Vec<&str> = line.split_whitespace().collect();
+            let value: f64 = words.pop().unwrap().parse().unwrap();
+            for name in &words {
+                for spelling in [name.to_string(), name.to_ascii_uppercase()] {
+                    let actual = eval_str(&spelling, x);
+                    assert_eq!(actual.re.to_bits(), value.to_bits(), "{spelling}");
+                    assert_eq!(actual.im, 0.0, "{spelling}");
+                }
+            }
+            names += words.len();
+        }
+        assert_eq!((NAMED_CONSTANT_VALUES.lines().count(), names), (42, 59));
+    }
+
+    #[test]
+    fn named_constants_work_in_expressions() {
+        let x = C::new(1.5, -0.5);
+        assert_close(eval_str("2*pi", x), eval_str("tau", x), 0.0);
+        assert_close(eval_str("-towermin", x), C::new(-0.06598803584531254, 0.0), 0.0);
+        for (left, right) in [
+            ("eta^e", "e"),
+            ("phi^2 - phi - 1", "0"),
+            ("towermin", "exp(-e)"),
+            ("einv", "1/e"),
+            ("omega exp(omega)", "1"),
+            ("cos(dottie)", "dottie"),
+            ("90deg", "halfpi"),
+            ("2√3 sqrt3", "6"),
+            ("zeta2", "π^2/6"),
+            ("gelfond", "e^pi"),
+            ("gelfondschneider", "2^sqrt2"),
+            ("silver", "1 + √2"),
+            ("sqrt5", "2φ - 1"),
+            ("√π^2", "pi"),
+            ("ln2 + ln10", "ln(20)"),
+            ("plastic^3", "plastic + 1"),
+            ("supergolden^3", "supergolden^2 + 1"),
+            ("tribonacci^3", "tribonacci^2 + tribonacci + 1"),
+            ("ϖ", "pi gauss"),
+            ("levy", "exp(pi^2/(12 ln2))"),
+            ("parabolic", "sqrt2 + ln(1 + sqrt2)"),
+            ("laplace exp(sqrt(1 + laplace^2))", "1 + sqrt(1 + laplace^2)"),
+            ("ln(ramanujan)", "pi sqrt(163)"),
+            ("x^γ + Ω", "x^eulergamma + omega"),
+        ] {
+            assert_close(eval_str(left, x), eval_str(right, x), 1e-12);
+        }
+        let cli = parse_cli(&["--iter=eta*i-towermin".to_owned(), "exp(x)".to_owned()]).unwrap();
+        assert_close(cli.iter.unwrap(), C::new(-0.06598803584531254, 1.444667861009766), 1e-15);
+    }
+
+    #[test]
+    fn bare_gamma_is_the_constant_and_gamma_call_the_function() {
+        let x = C::new(1.5, -0.5);
+        let gamma = C::new(0.5772156649015329, 0.0);
+        assert_close(eval_str("gamma(5)", x), C::new(24.0, 0.0), 1e-9);
+        assert_close(eval_str("gamma (gamma)", x), complex_gamma(gamma), 0.0);
+        assert_close(eval_str("gamma(1/4)^2/(2 sqrt(2 pi))", x), eval_str("lemniscate", x), 1e-9);
+        // The aliases are only the constant.
+        assert_close(eval_str("γ(5)", x), gamma * 5.0, 1e-15);
+        assert_close(eval_str("eulergamma(5)", x), gamma * 5.0, 1e-15);
+    }
+
+    #[test]
+    fn unknown_identifiers_still_fail() {
+        assert_eq!(Parser::parse("bogus").unwrap_err(), "unknown identifier `bogus` near byte 0");
+        assert_eq!(Parser::parse("2*golde").unwrap_err(), "unknown identifier `golde` near byte 2");
+        for input in ["tgamma", "zeta", "sqrt7", "√7", "√(2)", "ω", "Φ", "pix"] {
+            assert!(Parser::parse(input).is_err(), "{input}");
+        }
+    }
+
     #[test]
     fn rejects_invalid_expressions() {
         assert!(Parser::parse("").is_err());
@@ -4149,6 +4358,13 @@ esac
         for source in ["9001^^x", "9002^^x", "9003^^x"] {
             assert!(!is_finite_c(eval_str(source, x)), "{source}");
         }
+
+        std::fs::write(&calls_path, "").unwrap();
+        assert_eq!(parse_f64_arg("re(1.5^^2) + im(ssrt(2, 3)) - re(ate(2, 3))", "re_min"), Ok(7.0));
+        assert_eq!(read_calls(), [(real(1.5), real(2.0))]);
+        assert!(parse_f64_arg("1.5^^2", "re_min")
+            .unwrap_err()
+            .ends_with("`1.5^^2` = 4+5i is not a real number"));
 
         std::fs::write(&calls_path, "").unwrap();
         let domain = square_domain(C::new(1.25, -0.125), 0.125);
@@ -4707,6 +4923,88 @@ esac
         let cli = parse_cli(&args(&["--color=4d", "--", "--x"])).unwrap();
         assert_eq!(cli.function, "--x");
         assert_eq!(cli.color_mode, ColorMode::FourD);
+    }
+
+    #[test]
+    fn domain_arguments_are_numbers_or_constant_expressions() {
+        for (text, expected) in [("2.5", 2.5), ("-1e-3", -0.001), ("+.5", 0.5), ("1e5", 100000.0)] {
+            assert_eq!(parse_f64_arg(text, "re_min"), Ok(expected), "{text}");
+        }
+        let (pi, e) = (std::f64::consts::PI, std::f64::consts::E);
+        for (text, expected) in [
+            ("pi", pi),
+            ("-pi", -pi),
+            ("+tau", 2.0 * pi),
+            ("-towermin", -0.06598803584531254),
+            ("Golden", 1.618033988749895),
+            ("pi/2", pi / 2.0),
+            ("-2*e", -2.0 * e),
+            ("sqrt(2)+1", 2.414213562373095),
+            ("exp(i*pi)", -1.0),
+            ("pi*e^e-pow(2, 0.5)", 46.19430536603135),
+        ] {
+            let value = parse_f64_arg(text, "re_min").unwrap();
+            assert!((value - expected).abs() <= 1e-12, "{text}: {value}");
+        }
+
+        assert_eq!(
+            parse_f64_arg("x+1", "re_min").unwrap_err(),
+            "re_min must be a number or a constant expression without variables, got 'x+1': \
+             expected a constant, but the expression depends on x"
+        );
+        for (text, reason) in [
+            ("2z", "the expression depends on x"),
+            ("i", "`i` = 0+1i is not a real number"),
+            ("sqrt(-1)", "is not a real number"),
+            ("1/0", "`1/0` is not a finite number"),
+            ("inf", "`inf` is not a finite number"),
+            ("abc", "unknown identifier `abc` near byte 0"),
+            ("1,5", "expected end of expression at byte 1"),
+            ("", "expected a number, identifier, function call, or `(` at byte 0"),
+        ] {
+            let err = parse_f64_arg(text, "im_max").unwrap_err();
+            assert!(err.starts_with("im_max must be a number or a constant "), "{text}: {err}");
+            assert!(err.ends_with(reason), "{text}: {err}");
+        }
+
+        let cli =
+            parse_cli(&["x", "-pi", "tau/2", "-sqrt(2)", "pi*e^e-pow(2, 0.5)"].map(str::to_owned))
+                .unwrap();
+        assert_eq!((cli.re.min, cli.re.max, cli.im.min), (-pi, pi, -std::f64::consts::SQRT_2));
+        assert!((cli.im.max - 46.19430536603135).abs() <= 1e-12);
+        assert!(parse_cli(&["x", "-pi", "x", "-1", "1"].map(str::to_owned)).is_err());
+    }
+
+    #[test]
+    fn rejected_domain_ranges_are_named_and_listed_with_the_argument_order() {
+        let error = |list: [&str; 5]| parse_cli(&list.map(str::to_owned)).err().unwrap();
+        assert_eq!(
+            error(["f", "2", "1", "0", "pi"]),
+            "Invalid real range [2, 1]: re_min must be smaller than re_max\n\
+             Detected ranges: real [2, 1] from '2' '1', imaginary [0, 3.141592653589793] from '0' 'pi'\n\
+             The range arguments are: re_min re_max im_min im_max"
+        );
+        assert_eq!(
+            error(["f", "1", "2", "pi", "0"]),
+            "Invalid imaginary range [3.141592653589793, 0]: im_min must be smaller than im_max\n\
+             Detected ranges: real [1, 2] from '1' '2', imaginary [3.141592653589793, 0] from 'pi' '0'\n\
+             The range arguments are: re_min re_max im_min im_max"
+        );
+        let value = |text: &str| eval_str(text, C::new(0.0, 0.0)).re;
+        let (re_min, im_min) = (value("e^-e"), value("1/(1/e)"));
+        assert_eq!(
+            error(["x^^x", "e^-e", "0", "1/(1/e)", "0"]),
+            format!(
+                "Invalid real range [{re_min}, 0] and imaginary range [{im_min}, 0]: \
+                 each min must be smaller than its max\n\
+                 Detected ranges: real [{re_min}, 0] from 'e^-e' '0', \
+                 imaginary [{im_min}, 0] from '1/(1/e)' '0'\n\
+                 The range arguments are: re_min re_max im_min im_max"
+            )
+        );
+        // All four arguments are evaluated before the ranges are checked.
+        assert!(error(["f", "2", "1", "x", "0"]).starts_with("im_min must be "));
+        assert!(error(["f", "0", "1/0", "0", "1"]).starts_with("re_max must be "));
     }
 
     #[test]
