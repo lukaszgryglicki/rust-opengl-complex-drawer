@@ -260,7 +260,7 @@ The iso-line count can be adjusted from `1` to `255`.
 
 Supported operators: `+`, `-`, `*`, `/`, `^`, `^^`, parentheses, comma-separated function calls, unary signs, and implicit multiplication such as `2x`, `2sin(x)`, `(x+1)(x-1)`.
 
-`base^^height` runs PATH's external `tet -q 10 base_re base_im height_re height_im`;
+`base^^height` runs PATH's external `tet -q 13 base_re base_im height_re height_im`;
 no tetration algorithm is implemented here. `^^` binds more tightly than `^`,
 and both associate right before unary signs: `a^^b^^c` is `a^^(b^^c)`,
 `a^^b^c` is `(a^^b)^c`, and `-x^^2` is `-(x^^2)`. Both operands can be expressions,
@@ -268,8 +268,8 @@ for example `x^^x-x^x+x` or `(1.333-0.06i)^^sin(x)`.
 
 The inverses of tetration solve `b^^h = z` through the same executable:
 `slog(b, z)` (alias `ate`) is the super-logarithm, the height `h`, and runs
-`tet -q --slog 10 b_re b_im z_re z_im`; `ssrt(z, h)` (alias `sroot`) is the
-super-root, the base `b`, and runs `tet -q --sroot 10 z_re z_im h_re h_im`.
+`tet -q --slog 13 b_re b_im z_re z_im`; `ssrt(z, h)` (alias `sroot`) is the
+super-root, the base `b`, and runs `tet -q --sroot 13 z_re z_im h_re h_im`.
 Both arguments can be expressions, for example `x^^x + ate(2+i, x) - ssrt(x, 1.5-i)`.
 
 Grid sampling uses the existing CPU workers, with at most one `tet` process per

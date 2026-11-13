@@ -44,7 +44,7 @@ fn evaluate_with(
     let output = Command::new(program)
         .arg("-q")
         .args(mode)
-        .arg("10")
+        .arg("13")
         .args([
             a.re.to_string(),
             a.im.to_string(),

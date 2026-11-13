@@ -692,10 +692,10 @@ fn print_usage() {
     eprintln!("                     numerical regular iteration at a fixed point of f (slow); T=1 is plain f");
     eprintln!("  -h, --help         show this help");
     eprintln!("  --                 end of options (needed only for expressions starting with \"--\")");
-    eprintln!("  ^^ is tetration via PATH's tet -q 10 base_re base_im height_re height_im.");
+    eprintln!("  ^^ is tetration via PATH's tet -q 13 base_re base_im height_re height_im.");
     eprintln!("  ^^ binds tighter than ^; both associate right, before unary signs.");
     eprintln!("  slog(b,z) (or ate) is the height h and ssrt(z,h) (or sroot) the base b in b^^h = z,");
-    eprintln!("  via tet -q --slog 10 b_re b_im z_re z_im and tet -q --sroot 10 z_re z_im h_re h_im.");
+    eprintln!("  via tet -q --slog 13 b_re b_im z_re z_im and tet -q --sroot 13 z_re z_im h_re h_im.");
     eprintln!("  Constants (aliases): pi (π), e, tau (τ), phi (φ, golden), gamma (γ, eulergamma), catalan,");
     eprintln!("  apery (zeta3), zeta2 (basel), ln2, ln10, sqrt2 (√2), sqrt3 (√3), sqrt5 (√5), sqrtpi (√π),");
     eprintln!("  halfpi, eta (η, towermax), towermin, einv, omega (Ω), dottie, gelfond, gelfondschneider,");
@@ -4219,7 +4219,7 @@ mod tests {
                     &program,
                     r#"#!/bin/sh
 case "$2" in --slog | --sroot)
-    if [ "$#" -ne 7 ] || [ "$1" != -q ] || [ "$3" != 10 ] ||
+    if [ "$#" -ne 7 ] || [ "$1" != -q ] || [ "$3" != 13 ] ||
        [ "$SILENT" != 1 ] || [ "$RAYON_NUM_THREADS" != 1 ]; then
         echo 'incorrect invocation' >&2
         exit 2
@@ -4228,7 +4228,7 @@ case "$2" in --slog | --sroot)
     case "$2" in --slog) printf '6\n7\n' ;; *) printf '8\n9\n' ;; esac
     exit ;;
 esac
-if [ "$#" -ne 6 ] || [ "$1" != -q ] || [ "$2" != 10 ] ||
+if [ "$#" -ne 6 ] || [ "$1" != -q ] || [ "$2" != 13 ] ||
    [ "$SILENT" != 1 ] || [ "$RAYON_NUM_THREADS" != 1 ]; then
     echo 'incorrect invocation' >&2
     exit 2
