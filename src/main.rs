@@ -694,6 +694,8 @@ fn print_usage() {
     eprintln!("  --                 end of options (needed only for expressions starting with \"--\")");
     eprintln!("  ^^ is tetration via PATH's tet -q 13 base_re base_im height_re height_im.");
     eprintln!("  ^^ binds tighter than ^; both associate right, before unary signs.");
+    eprintln!("  tet(b,h) is b^^h written as a function.");
+    eprintln!("  A zero has no sign, as in tet: sqrt(-4) is 2i and ln(-1) is pi i.");
     eprintln!("  slog(b,z) (or ate) is the height h and ssrt(z,h) (or sroot) the base b in b^^h = z,");
     eprintln!("  via tet -q --slog 13 b_re b_im z_re z_im and tet -q --sroot 13 z_re z_im h_re h_im.");
     eprintln!("  Constants (aliases): pi (π), e, tau (τ), phi (φ, golden), gamma (γ, eulergamma), catalan,");
@@ -4318,6 +4320,12 @@ esac
             ("2^^-3^2", result, vec![(real(2.0), real(-9.0))]),
             ("(2^3)^^2", result, vec![(real(8.0), real(2.0))]),
             ("2^^(3^2)", result, vec![(real(2.0), real(9.0))]),
+            ("tet(2, 3)^2", result * result, vec![(real(2.0), real(3.0))]),
+            (
+                "3TET(x+1+2i, tet(x, 2))",
+                3.0 * result,
+                vec![(x, real(2.0)), (x + C::new(1.0, 2.0), result)],
+            ),
             (
                 "x^^x+x^^(x+1)",
                 result * 2.0,
@@ -4355,7 +4363,7 @@ esac
             "--slog 2 1 1.3 -0.2\n--sroot 1.3 -0.2 1.5 -1\n\
              --slog 1.3 -0.2 2 0\n--sroot 3 0 1.3 -0.2\n"
         );
-        for source in ["slog(x)", "ate()", "ssrt(x, 2, 3)", "sroot"] {
+        for source in ["slog(x)", "ate()", "ssrt(x, 2, 3)", "sroot", "tet(x)", "tet(x, 2, 3)", "tet"] {
             assert!(Parser::parse(source).is_err(), "{source}");
         }
 
@@ -4582,6 +4590,31 @@ esac
         assert_close(eval_str("conj(x)", x), C::new(0.7, -0.3), 1e-12);
         assert_close(eval_str("re(x)+i*im(x)", x), x, 1e-12);
         assert_close(eval_str("abs(3+4i)", x), C::new(5.0, 0.0), 1e-12);
+    }
+
+    #[test]
+    fn zero_parts_have_no_sign_so_negative_reals_take_the_principal_values() {
+        let x = C::new(4.0, 0.0);
+        let half_turn = std::f64::consts::PI;
+        let cube_root = C::new(1.0, 3.0_f64.sqrt());
+        for (source, expected) in [
+            ("sqrt(-4)", C::new(0.0, 2.0)),
+            ("sqrt(-x)", C::new(0.0, 2.0)),
+            ("sqrt(x/-1)", C::new(0.0, 2.0)),
+            ("sqrt(-2*-2 - 8)", C::new(0.0, 2.0)),
+            ("sqrt(conj(-x))", C::new(0.0, 2.0)),
+            ("ln(-1)", C::new(0.0, half_turn)),
+            ("arg(-x)", C::new(half_turn, 0.0)),
+            ("(-8)^(1/3)", cube_root),
+            ("cbrt(-8)", cube_root),
+            ("root(-1,2)", C::new(0.0, 1.0)),
+        ] {
+            assert_close(eval_str(source, x), expected, 1e-12);
+        }
+        for source in ["-0", "-0i", "0*-x", "conj(x)", "-x + x"] {
+            let value = eval_str(source, x);
+            assert!(value.re.is_sign_positive() && value.im.is_sign_positive(), "{source}: {value:?}");
+        }
     }
 
     #[test]
