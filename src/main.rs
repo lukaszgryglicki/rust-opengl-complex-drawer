@@ -675,6 +675,7 @@ fn parse_cli_or_exit() -> Cli {
 fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  complex_surface_viewer [options] \"exp(x)-ln(x)\" [re_min re_max im_min im_max]");
+    eprintln!("  complex_surface_viewer [options] \"exp(x)-ln(x)\" [min max]");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --color=MODE       initial color mode: solid, phase, height, rings, 4d (default: solid)");
@@ -706,9 +707,12 @@ fn print_usage() {
     eprintln!("  twinprime, mertens; README.md lists the values. gamma(x) is still the gamma function.");
     eprintln!("  re_min re_max im_min im_max are numbers or real constant expressions without variables,");
     eprintln!("  e.g. -pi/2, 2e, sqrt(2)+1, 1.5^^2.");
+    eprintln!("  min max are the two corners of the same rectangle, complex numbers or complex constant");
+    eprintln!("  expressions: min = re_min + i im_min, max = re_max + i im_max, e.g. -2-2i 2+2i.");
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  complex_surface_viewer \"exp(x)-ln(x)\" -2 2 -2 2");
+    eprintln!("  complex_surface_viewer \"exp(x)-ln(x)\" -2-2i 2+2i");
     eprintln!("  complex_surface_viewer \"sin(x)/x\"");
     eprintln!("  complex_surface_viewer \"eta^x-x\" 0 2e -pi/2 \"sqrt(2)+1\"");
     eprintln!("  complex_surface_viewer \"x^^x-x^x+x\" 1.25 1.5 -0.125 -0.0625");
@@ -760,17 +764,17 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
         }
     }
 
-    if positional.len() != 1 && positional.len() != 5 {
+    if !matches!(positional.len(), 1 | 3 | 5) {
         return Err(format!(
-            "Expected either 1 or 5 positional arguments, got {}.",
+            "Expected 1, 3 or 5 positional arguments, got {}.",
             positional.len()
         ));
     }
 
-    let (re, im) = if positional.len() == 5 {
-        parse_domain_args(&positional[1..])?
-    } else {
+    let (re, im) = if positional.len() == 1 {
         (Range::new(-2.0, 2.0)?, Range::new(-2.0, 2.0)?)
+    } else {
+        parse_domain_args(&positional[1..])?
     };
 
     Ok(Cli {
@@ -794,10 +798,27 @@ fn parse_f64_arg(s: &str, name: &str) -> Result<f64, String> {
         .map_err(|err| format!("{name} must be a number or a constant expression without variables, got '{s}': {err}"))
 }
 
-/// The real and imaginary ranges of the domain from the four range arguments.
+fn parse_corner_arg(s: &str, name: &str) -> Result<C, String> {
+    s.parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite())
+        .map_or_else(|| parse_complex_constant(s), |v| Ok(C::new(v, 0.0)))
+        .map_err(|err| {
+            format!("{name} must be a complex number or a constant expression without variables, got '{s}': {err}")
+        })
+}
+
+/// The real and imaginary ranges of the domain from the four range arguments, or from
+/// its two corners `min = re_min + i im_min` and `max = re_max + i im_max`.
 fn parse_domain_args(args: &[&str]) -> Result<(Range, Range), String> {
-    let (re_min, re_max) = (parse_f64_arg(args[0], "re_min")?, parse_f64_arg(args[1], "re_max")?);
-    let (im_min, im_max) = (parse_f64_arg(args[2], "im_min")?, parse_f64_arg(args[3], "im_max")?);
+    let (re_min, re_max, im_min, im_max) = if let [min, max] = args {
+        let (min, max) = (parse_corner_arg(min, "min")?, parse_corner_arg(max, "max")?);
+        (min.re, max.re, min.im, max.im)
+    } else {
+        let (re_min, re_max) = (parse_f64_arg(args[0], "re_min")?, parse_f64_arg(args[1], "re_max")?);
+        let (im_min, im_max) = (parse_f64_arg(args[2], "im_min")?, parse_f64_arg(args[3], "im_max")?);
+        (re_min, re_max, im_min, im_max)
+    };
     let (real, imaginary) = (format!("[{re_min}, {re_max}]"), format!("[{im_min}, {im_max}]"));
     let invalid = match (Range::new(re_min, re_max), Range::new(im_min, im_max)) {
         (Ok(re), Ok(im)) => return Ok((re, im)),
@@ -811,12 +832,20 @@ fn parse_domain_args(args: &[&str]) -> Result<(Range, Range), String> {
         (Err(err), _) => format!("real range {real}: {err}"),
         (_, Err(err)) => format!("imaginary range {imaginary}: {err}"),
     };
-    Err(format!(
-        "Invalid {invalid}\n\
-         Detected ranges: real {real} from '{}' '{}', imaginary {imaginary} from '{}' '{}'\n\
-         The range arguments are: re_min re_max im_min im_max",
-        args[0], args[1], args[2], args[3]
-    ))
+    Err(if let [min, max] = args {
+        format!(
+            "Invalid {invalid}\n\
+             Detected ranges: real {real}, imaginary {imaginary} from the corners '{min}' '{max}'\n\
+             The corner arguments are: min max, with min = re_min + i im_min and max = re_max + i im_max"
+        )
+    } else {
+        format!(
+            "Invalid {invalid}\n\
+             Detected ranges: real {real} from '{}' '{}', imaginary {imaginary} from '{}' '{}'\n\
+             The range arguments are: re_min re_max im_min im_max",
+            args[0], args[1], args[2], args[3]
+        )
+    })
 }
 
 #[derive(Clone)]
@@ -4383,6 +4412,9 @@ esac
         assert!(parse_f64_arg("1.5^^2", "re_min")
             .unwrap_err()
             .ends_with("`1.5^^2` = 4+5i is not a real number"));
+        std::fs::write(&calls_path, "").unwrap();
+        assert_eq!(parse_corner_arg("1.5^^2 - 1", "min"), Ok(C::new(3.0, 5.0)));
+        assert_eq!(read_calls(), [(real(1.5), real(2.0))]);
 
         std::fs::write(&calls_path, "").unwrap();
         let domain = square_domain(C::new(1.25, -0.125), 0.125);
@@ -5048,6 +5080,80 @@ esac
         // All four arguments are evaluated before the ranges are checked.
         assert!(error(["f", "2", "1", "x", "0"]).starts_with("im_min must be "));
         assert!(error(["f", "0", "1/0", "0", "1"]).starts_with("re_max must be "));
+    }
+
+    #[test]
+    fn two_complex_corners_are_the_domain_of_four_range_arguments() {
+        let parse = |list: &[&str]| parse_cli(&list.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let ranges = |list: &[&str]| {
+            let cli = parse(list).unwrap();
+            (cli.re.min, cli.re.max, cli.im.min, cli.im.max)
+        };
+        let expected = ranges(&["x", "-1", "1.5", "-2", "3"]);
+        assert_eq!(expected, (-1.0, 1.5, -2.0, 3.0));
+        for [min, max] in [
+            ["-1-2i", "1.5+3i"],
+            ["-2i-1", "3/2+3j"],
+            ["conj(-1+2i)", "abs(1.5)+sqrt(-9)"],
+        ] {
+            assert_eq!(ranges(&["x", min, max]), expected, "{min} {max}");
+        }
+        let (pi, e) = (std::f64::consts::PI, std::f64::consts::E);
+        assert_eq!(
+            ranges(&["--color=4d", "x^^x", "towermin-pi*i", "--show=re", "e+pi*i"]),
+            (0.06598803584531254, e, -pi, pi)
+        );
+        assert_eq!(ranges(&["x", "-2.5", "1e5+i"]), (-2.5, 100000.0, 0.0, 1.0));
+
+        for (corner, reason) in [
+            ("x+1", "expected a constant, but the expression depends on x"),
+            ("1/0", "`1/0` is not a finite number"),
+            ("inf", "`inf` is not a finite number"),
+            ("abc", "unknown identifier `abc` near byte 0"),
+        ] {
+            for (list, name) in [(["f", corner, "9+9i"], "min"), (["f", "-9-9i", corner], "max")] {
+                assert_eq!(
+                    parse(&list).err().unwrap(),
+                    format!(
+                        "{name} must be a complex number or a constant expression without variables, \
+                         got '{corner}': {reason}"
+                    )
+                );
+            }
+        }
+
+        let order = "The corner arguments are: min max, with min = re_min + i im_min and max = re_max + i im_max";
+        assert_eq!(
+            parse(&["f", "2", "1+pi*i"]).err().unwrap(),
+            format!(
+                "Invalid real range [2, 1]: re_min must be smaller than re_max\n\
+                 Detected ranges: real [2, 1], imaginary [0, 3.141592653589793] from the corners '2' '1+pi*i'\n\
+                 {order}"
+            )
+        );
+        // Two real numbers are the corners of a rectangle without height.
+        assert_eq!(
+            parse(&["f", "1", "2"]).err().unwrap(),
+            format!(
+                "Invalid imaginary range [0, 0]: im_min must be smaller than im_max\n\
+                 Detected ranges: real [1, 2], imaginary [0, 0] from the corners '1' '2'\n\
+                 {order}"
+            )
+        );
+        assert_eq!(
+            parse(&["f", "2+i", "1-i"]).err().unwrap(),
+            format!(
+                "Invalid real range [2, 1] and imaginary range [1, -1]: each min must be smaller than its max\n\
+                 Detected ranges: real [2, 1], imaginary [1, -1] from the corners '2+i' '1-i'\n\
+                 {order}"
+            )
+        );
+        for list in [&["f", "1"][..], &["f", "1", "2", "3"][..], &["f", "1", "2", "3", "4", "5"][..]] {
+            assert_eq!(
+                parse(list).err().unwrap(),
+                format!("Expected 1, 3 or 5 positional arguments, got {}.", list.len())
+            );
+        }
     }
 
     #[test]

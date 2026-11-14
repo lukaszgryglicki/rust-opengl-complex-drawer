@@ -20,6 +20,13 @@ The four optional numeric arguments are:
 re_min re_max im_min im_max
 ```
 
+The same rectangle can be given by its two corners as complex numbers,
+`min = re_min + i im_min` and `max = re_max + i im_max`:
+
+```bash
+cargo run --release -- "exp(x)-ln(x)" -2-2i 2+2i
+```
+
 If omitted, both domains default to `[-2, 2]`.
 
 Options (all optional, may appear anywhere among the positional arguments):
@@ -340,6 +347,12 @@ of this grammar without variables that evaluate to a finite real number, for exa
 ```bash
 cargo run --release -- "eta^x-x" 0 2e -pi/2 "sqrt(2)+1"
 ```
+
+With two arguments instead of four, `min max`, each is a number or a constant expression
+with a finite complex value, the lower left and the upper right corner of the domain:
+`-2-2i 2+2i`, or `"-pi/2*i" "2e+(sqrt(2)+1)i"` for the domain of the line above. Each of
+the four range arguments has to be real; `re(...)` and `im(...)` take the parts of any
+expression.
 
 Functions include: `abs`, `mag`, `mod`, `norm`, `abs2`, `mag2`, `norm_sqr`, `normsq`, `l1_norm`, `l1`, `manhattan`, `taxicab`, `arg`, `phase`, `to_polar`, `polar_r`, `radius`, `polar_theta`, `theta`, `re`, `real`, `im`, `imag`, `conj`, `conjugate`, `recip`, `inverse`, `inv`, `finv`, predicates such as `is_nan`, `is_infinite`, `is_finite`, `is_normal`, `sgn`, `sign`, `signum`, `cis`, `exp`, `exp2`, `expf`, `ln`, `log`, `log2`, `log10`, `sqrt`, `cbrt`, `sin`, `cos`, `tan`, inverse trig, hyperbolic functions, `sec`, `csc`, `cot`, `sech`, `csch`, `coth`, `gamma` (`tgamma`), `factorial` (`fact`), `tet`, `slog` (`ate`), `ssrt` (`sroot`), `pow`, `powc`, `powf`, `powi`, `powu`, `root`, `scale`, `unscale`, `fdiv`, `complex`, `rect`, `new`, `polar`, `from_polar`, and several component-wise rounding functions. Predicates return `1+0i` for true and `0+0i` for false.
 
