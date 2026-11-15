@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static REPORTED_ERRORS: AtomicUsize = AtomicUsize::new(0);
 
-/// The significant digits that `tet` is asked for unless `--tet-prec` gives others.
+/// The significant digits that `tet` is asked for: always for the constants of the command
+/// line, and for the function unless `--tet-prec` gives others.
 pub const DEFAULT_PRECISION: usize = 13;
 
 /// The most digits that `--tet-prec` takes: the results are kept as `f64` numbers, which hold

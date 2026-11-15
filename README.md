@@ -39,7 +39,7 @@ Options (all optional, may appear anywhere among the positional arguments):
 | `--screenshot=FILE` | render one frame, save it as PNG to `FILE` and exit (handy for scripting / headless checks under Xvfb)   |
 | `--csv=FILE`        | save the grid values as CSV to `FILE` plus the im=0 / re=0 lines to `FILE_im0` / `FILE_re0` and exit, see [CSV export](#csv-export) |
 | `--iter=T`          | plot the `T`-th iterate `f^T` for a complex `T` (`2`, `0.5`, `i`, `-.125-.02i`), see [Fractional iteration](#fractional-iteration) |
-| `--tet-prec=N`      | significant digits that `tet` is asked for, an integer from 1 to 15 (default 13); also `--tet-prec N`, see [Expression grammar](#expression-grammar) |
+| `--tet-prec=N`      | significant digits that `tet` is asked for when the function is calculated, an integer from 1 to 15 (default 13); also `--tet-prec N`, see [Expression grammar](#expression-grammar) |
 | `-h`, `--help`      | print usage, including the default color map spec                                                        |
 | `--`                | end of options; only needed for an expression that itself starts with `--`, e.g. `-- "--x"`              |
 
@@ -283,12 +283,14 @@ super-root, the base `b`, and runs `tet -q --sroot 13 z_re z_im h_re h_im`.
 Both arguments can be expressions, for example `x^^x + ate(2+i, x) - ssrt(x, 1.5-i)`.
 
 The `13` of those three commands is the number of significant digits that `tet` is asked
-for. `--tet-prec=N` (or `--tet-prec N`) asks for `N` instead, an integer from 1 to 15, in
-every run of `tet`: for the grid, for the constant expressions of the domain arguments and
-for `--iter`, wherever the option stands among the arguments. More than 15 digits would
-be lost: the values are kept as `f64` numbers, which hold 15 significant digits. Fewer
-digits make `tet` faster for some bases (base 2 at 3 digits takes about a quarter of the
-time of 13) and change nothing for others.
+for. `--tet-prec=N` (or `--tet-prec N`) asks for `N` instead, an integer from 1 to 15,
+when the function is calculated: for the grid, the lines along the axes, the derivatives
+and the fractional iteration, which can be hundreds of thousands of runs. The constant
+expressions of the domain arguments and of `--iter` are calculated once and keep the 13
+digits, so the domain does not move with the option. More than 15 digits would be lost:
+the values are kept as `f64` numbers, which hold 15 significant digits. Fewer digits make
+`tet` faster for some bases (base 2 at 3 digits takes about a quarter of the time of 13)
+and change nothing for others.
 
 Grid sampling uses the existing CPU workers, with at most one `tet` process per
 worker and `RAYON_NUM_THREADS=1` per child. Failed or nonfinite results become invalid

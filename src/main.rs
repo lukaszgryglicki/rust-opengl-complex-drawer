@@ -218,6 +218,9 @@ fn main() {
     // Parse CLI and the expression before creating the window, so `--help`,
     // usage errors and parse errors work without a GPU/display.
     let cli = parse_cli_or_exit();
+    // The constants of the command line were calculated with the default digits; --tet-prec
+    // is for the function, which is calculated from here on.
+    tetration::set_precision(cli.tet_prec);
     let expr = match Parser::parse(&cli.function) {
         Ok(expr) => expr,
         Err(err) => {
@@ -694,9 +697,10 @@ fn print_usage() {
     eprintln!("  --iter=T           plot the T-th iterate of f (complex T, e.g. 2, 0.5, i, -.125-.02i):");
     eprintln!("                     T=0 identity, positive integers compose f directly, anything else uses");
     eprintln!("                     numerical regular iteration at a fixed point of f (slow); T=1 is plain f");
-    eprintln!("  --tet-prec=N       significant digits that tet is asked for, from 1 to 15 (default: 13, the");
-    eprintln!("                     13 of the tet commands below); also --tet-prec N. The values are kept as");
-    eprintln!("                     f64 numbers, which hold 15 digits");
+    eprintln!("  --tet-prec=N       significant digits that tet is asked for when the function is calculated,");
+    eprintln!("                     from 1 to 15 (default: 13, the 13 of the tet commands below); also");
+    eprintln!("                     --tet-prec N. Constant arguments keep 13. The values are kept as f64");
+    eprintln!("                     numbers, which hold 15 digits");
     eprintln!("  -h, --help         show this help");
     eprintln!("  --                 end of options (needed only for expressions starting with \"--\")");
     eprintln!("  ^^ is tetration via PATH's tet -q 13 base_re base_im height_re height_im.");
@@ -729,7 +733,8 @@ fn print_usage() {
 }
 
 /// Takes `--tet-prec=N` (or `--tet-prec N`) out of the arguments: the significant digits that
-/// `tet` is asked for, 13 without the option, and the other arguments in their order.
+/// `tet` is asked for when the function is calculated, 13 without the option, and the other
+/// arguments in their order.
 fn take_tet_prec(args: &[String]) -> Result<(usize, Vec<&String>), String> {
     let mut digits = tetration::DEFAULT_PRECISION;
     let mut rest = Vec::with_capacity(args.len());
@@ -762,9 +767,7 @@ fn take_tet_prec(args: &[String]) -> Result<(usize, Vec<&String>), String> {
 }
 
 fn parse_cli(args: &[String]) -> Result<Cli, String> {
-    // Constant arguments can run tet, so its precision is set before any of them is read.
     let (tet_prec, args) = take_tet_prec(args)?;
-    tetration::set_precision(tet_prec);
     let mut color_mode = ColorMode::Solid;
     let mut visibility = SurfaceVisibility::default();
     let mut colormap = ColorMap::default();
@@ -902,7 +905,8 @@ struct Cli {
     screenshot: Option<String>,
     csv: Option<String>,
     iter: Option<C>,
-    /// `--tet-prec`: the significant digits that `tet` is asked for.
+    /// `--tet-prec`: the significant digits that `tet` is asked for when the function is
+    /// calculated. The constants of the command line keep 13.
     tet_prec: usize,
 }
 
@@ -4613,11 +4617,9 @@ esac
         assert_eq!(axes(&state), grid_axes);
         assert_eq!(read_calls().len(), expected_calls);
 
-        // --tet-prec: the digits of every later run, also of the constant arguments of the same
-        // command line, wherever the option stands among them. The script takes only the digits
-        // of this file while it exists.
-        let digits_path = directory.join("tet.digits");
-        std::fs::write(&digits_path, "7").unwrap();
+        // --tet-prec is for the calculation of the function. The constants of the command line
+        // keep the 13 digits, which the script insists on here, and reading the arguments does
+        // not change what tet is asked for afterwards.
         std::fs::write(&calls_path, "").unwrap();
         let cli =
             parse_cli(&["x^^x", "1.5^^2 - 4 - 5i", "--tet-prec", "7", "1.5^^2"].map(str::to_owned)).unwrap();
@@ -4626,16 +4628,21 @@ esac
         assert_eq!(read_calls(), [(real(1.5), real(2.0)); 2]);
         let cli = parse_cli(&["--iter=1.5^^2", "--tet-prec=7", "exp(x)"].map(str::to_owned)).unwrap();
         assert_eq!((cli.iter, cli.tet_prec), (Some(result), 7));
+        assert_close(eval_str("x^^x", x), result, 1e-10);
+        // `main` sets the digits after that, for every later run. The script takes only the
+        // digits of this file while it exists.
+        let digits_path = directory.join("tet.digits");
+        let refused = || ["x^^x", "ate(2, x)", "ssrt(x, 2)"].iter().all(|source| !is_finite_c(eval_str(source, x)));
+        std::fs::write(&digits_path, "7").unwrap();
+        assert!(refused());
+        tetration::set_precision(cli.tet_prec);
         assert_close(
             eval_str("x^^x + ate(2+i, x) - ssrt(x, 1.5-i)", x),
             result + slog - ssrt,
             1e-10,
         );
-        // Without the option the digits are 13 again, which the script refuses for now.
-        assert_eq!(parse_cli(&["x^^x".to_owned()]).unwrap().tet_prec, 13);
-        for source in ["x^^x", "ate(2, x)", "ssrt(x, 2)"] {
-            assert!(!is_finite_c(eval_str(source, x)), "{source}");
-        }
+        tetration::set_precision(tetration::DEFAULT_PRECISION);
+        assert!(refused());
         std::fs::remove_file(&digits_path).unwrap();
         assert_close(eval_str("x^^x", x), result, 1e-10);
     }
@@ -5096,6 +5103,8 @@ esac
         assert!(taken(&["--tet-prec", "--color=4d", "x"]).is_err());
         assert!(parse_cli(&args(&["--tet-precision=3", "x"])).is_err());
         assert_eq!(parse_cli(&args(&["x^2"])).unwrap().tet_prec, 13);
+        let cli = parse_cli(&args(&["--tet-prec", "5", "x^2", "-1", "1", "-2", "2"])).unwrap();
+        assert_eq!((cli.tet_prec, cli.function.as_str(), cli.re.min, cli.im.max), (5, "x^2", -1.0, 2.0));
     }
 
     #[test]
