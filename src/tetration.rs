@@ -5,6 +5,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static REPORTED_ERRORS: AtomicUsize = AtomicUsize::new(0);
 
+/// The significant digits that `tet` is asked for unless `--tet-prec` gives others.
+pub const DEFAULT_PRECISION: usize = 13;
+
+/// The most digits that `--tet-prec` takes: the results are kept as `f64` numbers, which hold
+/// every number of 15 significant digits.
+pub const MAX_PRECISION: usize = f64::DIGITS as usize;
+
+static PRECISION: AtomicUsize = AtomicUsize::new(DEFAULT_PRECISION);
+
+/// Sets the significant digits that every later run of `tet` is asked for.
+pub fn set_precision(digits: usize) {
+    PRECISION.store(digits, Ordering::Relaxed);
+}
+
 pub fn evaluate(base: Complex64, height: Complex64) -> Complex64 {
     solve(None, base, height)
 }
@@ -44,7 +58,7 @@ fn evaluate_with(
     let output = Command::new(program)
         .arg("-q")
         .args(mode)
-        .arg("13")
+        .arg(PRECISION.load(Ordering::Relaxed).to_string())
         .args([
             a.re.to_string(),
             a.im.to_string(),

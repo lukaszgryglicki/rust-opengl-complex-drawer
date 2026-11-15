@@ -230,6 +230,9 @@ fn main() {
     println!("Real domain: [{}, {}]", cli.re.min, cli.re.max);
     println!("Imag domain: [{}, {}]", cli.im.min, cli.im.max);
     println!("Samples: {} x {}", DEFAULT_SAMPLES_PER_AXIS, DEFAULT_SAMPLES_PER_AXIS);
+    if cli.tet_prec != tetration::DEFAULT_PRECISION {
+        println!("Tetration precision (--tet-prec): {}", cli.tet_prec);
+    }
 
     let iterate = match cli.iter {
         Some(t) => {
@@ -691,6 +694,9 @@ fn print_usage() {
     eprintln!("  --iter=T           plot the T-th iterate of f (complex T, e.g. 2, 0.5, i, -.125-.02i):");
     eprintln!("                     T=0 identity, positive integers compose f directly, anything else uses");
     eprintln!("                     numerical regular iteration at a fixed point of f (slow); T=1 is plain f");
+    eprintln!("  --tet-prec=N       significant digits that tet is asked for, from 1 to 15 (default: 13, the");
+    eprintln!("                     13 of the tet commands below); also --tet-prec N. The values are kept as");
+    eprintln!("                     f64 numbers, which hold 15 digits");
     eprintln!("  -h, --help         show this help");
     eprintln!("  --                 end of options (needed only for expressions starting with \"--\")");
     eprintln!("  ^^ is tetration via PATH's tet -q 13 base_re base_im height_re height_im.");
@@ -722,7 +728,43 @@ fn print_usage() {
     eprintln!("  complex_surface_viewer --iter=0.5 --color=4d --show=re \"exp(x)\"");
 }
 
+/// Takes `--tet-prec=N` (or `--tet-prec N`) out of the arguments: the significant digits that
+/// `tet` is asked for, 13 without the option, and the other arguments in their order.
+fn take_tet_prec(args: &[String]) -> Result<(usize, Vec<&String>), String> {
+    let mut digits = tetration::DEFAULT_PRECISION;
+    let mut rest = Vec::with_capacity(args.len());
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let value = match arg.strip_prefix("--tet-prec") {
+            Some("") => args.next().map_or("", String::as_str),
+            Some(value) if value.starts_with('=') => &value[1..],
+            _ => {
+                rest.push(arg);
+                if arg == "--" {
+                    // End of options: what follows is positional, whatever it looks like.
+                    rest.extend(args.by_ref());
+                }
+                continue;
+            }
+        };
+        digits = value
+            .parse::<usize>()
+            .ok()
+            .filter(|digits| (1..=tetration::MAX_PRECISION).contains(digits))
+            .ok_or_else(|| {
+                format!(
+                    "--tet-prec requires the digits that tet is asked for, an integer from 1 to {}, got '{value}'",
+                    tetration::MAX_PRECISION
+                )
+            })?;
+    }
+    Ok((digits, rest))
+}
+
 fn parse_cli(args: &[String]) -> Result<Cli, String> {
+    // Constant arguments can run tet, so its precision is set before any of them is read.
+    let (tet_prec, args) = take_tet_prec(args)?;
+    tetration::set_precision(tet_prec);
     let mut color_mode = ColorMode::Solid;
     let mut visibility = SurfaceVisibility::default();
     let mut colormap = ColorMap::default();
@@ -787,6 +829,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
         screenshot,
         csv,
         iter,
+        tet_prec,
     })
 }
 
@@ -859,6 +902,8 @@ struct Cli {
     screenshot: Option<String>,
     csv: Option<String>,
     iter: Option<C>,
+    /// `--tet-prec`: the significant digits that `tet` is asked for.
+    tet_prec: usize,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -4259,8 +4304,10 @@ mod tests {
                 std::fs::write(
                     &program,
                     r#"#!/bin/sh
+digits=13
+[ -f "$0.digits" ] && digits=$(cat "$0.digits")
 case "$2" in --slog | --sroot)
-    if [ "$#" -ne 7 ] || [ "$1" != -q ] || [ "$3" != 13 ] ||
+    if [ "$#" -ne 7 ] || [ "$1" != -q ] || [ "$3" != "$digits" ] ||
        [ "$SILENT" != 1 ] || [ "$RAYON_NUM_THREADS" != 1 ]; then
         echo 'incorrect invocation' >&2
         exit 2
@@ -4269,7 +4316,7 @@ case "$2" in --slog | --sroot)
     case "$2" in --slog) printf '6\n7\n' ;; *) printf '8\n9\n' ;; esac
     exit ;;
 esac
-if [ "$#" -ne 6 ] || [ "$1" != -q ] || [ "$2" != 13 ] ||
+if [ "$#" -ne 6 ] || [ "$1" != -q ] || [ "$2" != "$digits" ] ||
    [ "$SILENT" != 1 ] || [ "$RAYON_NUM_THREADS" != 1 ]; then
     echo 'incorrect invocation' >&2
     exit 2
@@ -4565,6 +4612,32 @@ esac
         assert_eq!(read_calls().len(), expected_calls);
         assert_eq!(axes(&state), grid_axes);
         assert_eq!(read_calls().len(), expected_calls);
+
+        // --tet-prec: the digits of every later run, also of the constant arguments of the same
+        // command line, wherever the option stands among them. The script takes only the digits
+        // of this file while it exists.
+        let digits_path = directory.join("tet.digits");
+        std::fs::write(&digits_path, "7").unwrap();
+        std::fs::write(&calls_path, "").unwrap();
+        let cli =
+            parse_cli(&["x^^x", "1.5^^2 - 4 - 5i", "--tet-prec", "7", "1.5^^2"].map(str::to_owned)).unwrap();
+        assert_eq!(cli.tet_prec, 7);
+        assert_eq!((cli.re.min, cli.re.max, cli.im.min, cli.im.max), (0.0, 4.0, 0.0, 5.0));
+        assert_eq!(read_calls(), [(real(1.5), real(2.0)); 2]);
+        let cli = parse_cli(&["--iter=1.5^^2", "--tet-prec=7", "exp(x)"].map(str::to_owned)).unwrap();
+        assert_eq!((cli.iter, cli.tet_prec), (Some(result), 7));
+        assert_close(
+            eval_str("x^^x + ate(2+i, x) - ssrt(x, 1.5-i)", x),
+            result + slog - ssrt,
+            1e-10,
+        );
+        // Without the option the digits are 13 again, which the script refuses for now.
+        assert_eq!(parse_cli(&["x^^x".to_owned()]).unwrap().tet_prec, 13);
+        for source in ["x^^x", "ate(2, x)", "ssrt(x, 2)"] {
+            assert!(!is_finite_c(eval_str(source, x)), "{source}");
+        }
+        std::fs::remove_file(&digits_path).unwrap();
+        assert_close(eval_str("x^^x", x), result, 1e-10);
     }
 
     #[test]
@@ -4998,6 +5071,31 @@ esac
         let cli = parse_cli(&args(&["--color=4d", "--", "--x"])).unwrap();
         assert_eq!(cli.function, "--x");
         assert_eq!(cli.color_mode, ColorMode::FourD);
+
+        // --tet-prec in both forms: the digits and the other arguments in their order. The last
+        // one counts, and after "--" it is no option.
+        let taken = |list: &[&str]| {
+            take_tet_prec(&args(list)).map(|(digits, rest)| (digits, rest.into_iter().cloned().collect::<Vec<_>>()))
+        };
+        assert_eq!(taken(&["x", "-1", "1"]), Ok((13, args(&["x", "-1", "1"]))));
+        assert_eq!(taken(&["--tet-prec=7", "x"]), Ok((7, args(&["x"]))));
+        assert_eq!(
+            taken(&["--color=4d", "--tet-prec", "15", "x", "--tet-prec=1"]),
+            Ok((1, args(&["--color=4d", "x"])))
+        );
+        assert_eq!(taken(&["--tet-prec=2", "--", "--tet-prec=9"]), Ok((2, args(&["--", "--tet-prec=9"]))));
+        for value in ["0", "16", "-1", "2.5", "1e1", "many", ""] {
+            for list in [vec![format!("--tet-prec={value}"), "x".to_owned()], args(&["x", "--tet-prec", value])] {
+                assert_eq!(
+                    take_tet_prec(&list).unwrap_err(),
+                    format!("--tet-prec requires the digits that tet is asked for, an integer from 1 to 15, got '{value}'")
+                );
+            }
+        }
+        assert!(taken(&["x", "--tet-prec"]).is_err());
+        assert!(taken(&["--tet-prec", "--color=4d", "x"]).is_err());
+        assert!(parse_cli(&args(&["--tet-precision=3", "x"])).is_err());
+        assert_eq!(parse_cli(&args(&["x^2"])).unwrap().tet_prec, 13);
     }
 
     #[test]
