@@ -20,3 +20,5 @@ out
 *.png
 *.secret
 *.csv
+/complex_surface_viewer
+/complex_surface_viewer.static

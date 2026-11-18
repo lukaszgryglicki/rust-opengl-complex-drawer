@@ -7,6 +7,10 @@ edition = "2021"
 macroquad = "0.4.14"
 num-complex = "0.4.6"
 
+# For the tests of the console back end in third_party/miniquad (tests/console.rs).
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dev-dependencies]
+libc = "0.2"
+
 # miniquad (macroquad's platform backend) has no FreeBSD support upstream:
 # on FreeBSD its start() compiles to an empty function, so the app exits
 # silently without ever opening a window. We vendor miniquad 0.4.8 with the

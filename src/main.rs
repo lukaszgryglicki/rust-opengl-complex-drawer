@@ -196,7 +196,9 @@ struct Shading<'a> {
     colormap: &'a ColorMap,
 }
 
-fn window_conf() -> macroquad::conf::Conf {
+/// With `console` the window is the screen of the text console although a display is set;
+/// without a display it always is.
+fn window_conf(console: bool) -> macroquad::conf::Conf {
     macroquad::conf::Conf {
         miniquad_conf: macroquad::miniquad::conf::Conf {
             window_title: "Complex function surface viewer".to_owned(),
@@ -204,6 +206,10 @@ fn window_conf() -> macroquad::conf::Conf {
             window_height: 900,
             high_dpi: true,
             sample_count: 4,
+            platform: macroquad::miniquad::conf::Platform {
+                linux_console: console,
+                ..Default::default()
+            },
             ..Default::default()
         },
         // draw_mesh() uses u16 indices internally. Larger sample grids are split into
@@ -262,7 +268,7 @@ fn main() {
     };
     println!("Press F1 in the window for controls.");
 
-    macroquad::Window::from_config(window_conf(), run_viewer(cli, expr, iterate));
+    macroquad::Window::from_config(window_conf(cli.console), run_viewer(cli, expr, iterate));
 
     // On a working platform `Window::from_config` blocks until the user quits,
     // and at least one frame is always rendered first. If we get here without
@@ -701,6 +707,8 @@ fn print_usage() {
     eprintln!("                     from 1 to 15 (default: 13, the 13 of the tet commands below); also");
     eprintln!("                     --tet-prec N. Constant arguments keep 13. The values are kept as f64");
     eprintln!("                     numbers, which hold 15 digits");
+    eprintln!("  --console          draw on the whole screen of the text console although DISPLAY is set;");
+    eprintln!("                     without an X11 display that happens by itself (Linux and FreeBSD)");
     eprintln!("  -h, --help         show this help");
     eprintln!("  --                 end of options (needed only for expressions starting with \"--\")");
     eprintln!("  ^^ is tetration via PATH's tet -q 13 base_re base_im height_re height_im.");
@@ -774,6 +782,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
     let mut screenshot = None;
     let mut csv = None;
     let mut iter = None;
+    let mut console = false;
     let mut positional = Vec::<&str>::new();
     let mut options_done = false;
 
@@ -802,6 +811,8 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
                 return Err("--csv requires a file name".to_owned());
             }
             csv = Some(value.to_owned());
+        } else if arg == "--console" {
+            console = true;
         } else if arg.starts_with("--") {
             return Err(format!("Unknown option '{arg}'"));
         } else {
@@ -833,6 +844,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
         csv,
         iter,
         tet_prec,
+        console,
     })
 }
 
@@ -908,6 +920,8 @@ struct Cli {
     /// `--tet-prec`: the significant digits that `tet` is asked for when the function is
     /// calculated. The constants of the command line keep 13.
     tet_prec: usize,
+    /// `--console`: the window is the screen of the text console although a display is set.
+    console: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -5034,6 +5048,9 @@ esac
         assert!(cli.screenshot.is_none());
         assert!(cli.csv.is_none());
         assert_eq!((cli.re.min, cli.re.max, cli.im.min, cli.im.max), (-2.0, 2.0, -2.0, 2.0));
+        assert!(!cli.console);
+        assert!(parse_cli(&args(&["x^2", "-1", "1", "--console", "-2", "2"])).unwrap().console);
+        assert!(parse_cli(&args(&["--console=1", "x^2"])).is_err());
 
         let cli = parse_cli(&args(&[
             "--color=4d",

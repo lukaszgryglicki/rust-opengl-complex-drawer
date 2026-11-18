@@ -169,6 +169,11 @@ pub struct Platform {
     // for most purposes they are the same so we just use class name for simplicity
     // https://unix.stackexchange.com/questions/494169/
     pub linux_wm_class: &'static str,
+
+    /// If `true`, the window is the whole screen of the text console although an X11 or
+    /// Wayland display is set: SDL2, which is loaded then, shows it with its KMSDRM driver or
+    /// the one that `SDL_VIDEODRIVER` names. Without a display the window always is that.
+    pub linux_console: bool,
 }
 
 impl Default for Platform {
@@ -183,6 +188,7 @@ impl Default for Platform {
             framebuffer_alpha: false,
             wayland_decorations: WaylandDecorations::default(),
             linux_wm_class: "miniquad-application",
+            linux_console: false,
         }
     }
 }

@@ -86,6 +86,9 @@ pub mod linux_x11;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub mod linux_wayland;
 
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub mod linux_sdl2;
+
 #[cfg(target_os = "android")]
 pub mod android;
 

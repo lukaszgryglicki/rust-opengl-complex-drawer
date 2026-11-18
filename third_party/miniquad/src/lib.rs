@@ -349,6 +349,14 @@ where
     {
         let mut f = Some(f);
         let f = &mut f;
+        if native::linux_sdl2::wanted(&conf) {
+            // Nothing else can show the window then, and the console is given back by now.
+            if let Err(error) = native::linux_sdl2::run(&conf, f) {
+                eprintln!("error: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
         match conf.platform.linux_backend {
             conf::LinuxBackend::X11Only => {
                 native::linux_x11::run(&conf, f).expect("X11 backend failed")
